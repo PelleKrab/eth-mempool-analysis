@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Results and data
+results/
+*.parquet
+*.csv
+*.json
+*.xlsx
+
+# Logs
+logs/
+*.log
+
+# Config with credentials
+config/config.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
