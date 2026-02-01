@@ -1,15 +1,16 @@
-# Ethereum Mempool Historical Analysis
+# Ethereum FOCIL Censorship Analysis
 
-Batch processing system for analyzing 5 years of Ethereum mempool data to study inclusion lists, transaction censorship, and bandwidth savings.
+Analysis system for studying Ethereum transaction censorship using FOCIL (Fork-Choice enforced Inclusion Lists) methodology.
 
 ## Overview
 
-This project processes historical Ethereum mempool data from ClickHouse to generate insights about:
+This project processes historical Ethereum mempool data from ClickHouse to analyze transaction censorship patterns using the correct FOCIL research methodology:
 
-1. **Inclusion Lists (ILs)** - Transactions that should be included based on time windows
-2. **Bandwidth Savings** - Comparing 1-slot vs 2-slot IL strategies
-3. **Transaction Replacements** - Nonce-based RBF (Replace-By-Fee) behavior
-4. **Censorship Events** - Transactions that met inclusion criteria but weren't included
+1. **L₀ Inclusion Lists** - Highest-fee transactions from current block time window
+2. **L₋₁ Censored Transactions** - Transactions flagged as censored at N-1 (1-slot delay)
+3. **L₋₂ Censored Transactions** - Transactions flagged as censored at N-2 (2-slot delay)
+4. **Nonce Replacements** - User-initiated transaction replacements (excluded from censorship)
+5. **Censorship Detection** - Identifies transactions meeting fee requirements but excluded from blocks
 
 ## Architecture
 
@@ -46,22 +47,20 @@ This project processes historical Ethereum mempool data from ClickHouse to gener
 ```
 eth-mempool-analysis/
 ├── config/
-│   └── config.yaml           # Configuration (ClickHouse, params)
+│   └── config.yaml                  # Configuration (ClickHouse, params)
 ├── queries/
-│   ├── block_il_metrics.sql        # Inclusion list metrics per block
-│   ├── nonce_replacements.sql      # Transaction replacement detection
-│   ├── bandwidth_analysis.sql      # 1-slot vs 2-slot bandwidth
-│   └── censorship_events.sql       # Censorship detection
+│   ├── censorship_events.sql        # Censorship detection (reference)
+│   ├── nonce_replacements.sql       # Transaction replacement detection (reference)
+│   ├── block_il_metrics.sql         # Block metrics (reference)
+│   └── mempool_time_range.sql       # Mempool time window query (reference)
 ├── scripts/
-│   ├── batch_processor.py          # Main batch processing script
-│   └── analyze_results.py          # Analysis and visualization
-├── results/                   # Output directory (generated)
-│   ├── *.parquet             # Processed data
-│   ├── figures/              # Generated plots
-│   └── summary_report.md     # Summary statistics
-├── notebooks/                # Jupyter notebooks (optional)
-├── requirements.txt          # Python dependencies
-└── README.md                 # This file
+│   ├── proper_focil_analysis.py     # ✓ MAIN SCRIPT - Correct FOCIL implementation
+│   ├── batch_processor.py           # Legacy batch processor
+│   └── analyze_results.py           # Analysis and visualization
+├── results/                         # Output directory (generated)
+│   └── proper_focil_analysis.parquet  # Analysis results
+├── requirements.txt                 # Python dependencies
+└── README.md                        # This file
 ```
 
 ## Setup
@@ -107,168 +106,166 @@ analysis:
 
 ## Usage
 
-### Run Full Analysis (All 5 Years)
+### Run FOCIL Censorship Analysis
 
-Process all data in batches:
+**Main Script:** `proper_focil_analysis.py` - This implements the correct FOCIL research methodology.
 
 ```bash
 cd scripts
-python batch_processor.py
+python proper_focil_analysis.py
 ```
 
 This will:
-- Process blocks in monthly chunks
-- Run all SQL queries (IL metrics, replacements, bandwidth)
-- Save results to `results/*.parquet`
-- Take several hours to complete
+- Detect nonce replacements (to avoid false censorship flags)
+- Flag censored transactions at N-1 and N-2 based on:
+  - FOCIL-valid (max_fee >= base_fee)
+  - Competitive priority fee (>= 25th percentile)
+  - Sufficient dwell time (>= 12 seconds)
+  - NOT replaced by user
+  - Still in mempool (not included)
+- Construct L₀ with highest-fee transactions
+- Construct L₋₁ and L₋₂ with ONLY censored transactions
+- Calculate overlap and bandwidth metrics
+- Save results to `results/proper_focil_analysis.parquet`
 
-### Run Specific Analysis
+### Configure Block Range
 
-Process only certain metrics:
+Edit the script at lines 396-398:
 
-```bash
-# Just inclusion list metrics
-python batch_processor.py --query il_metrics
-
-# Just bandwidth analysis
-python batch_processor.py --query bandwidth
-
-# Just nonce replacements
-python batch_processor.py --query replacements
+```python
+start_block = 21575000
+end_block = 21575500    # Adjust as needed
+batch_size = 100        # Process in batches of 100 blocks
 ```
 
-### Custom Block Range
+### View Results
 
-```bash
-# Process specific range
-python batch_processor.py --start-block 15537394 --end-block 16000000
+The script outputs a summary to console and saves detailed results:
 
-# Smaller batches for testing
-python batch_processor.py --start-block 15537394 --end-block 15547394 --batch-size 1000
-```
+**Console Output:**
+- Blocks analyzed
+- L₀ average size and transaction count
+- L₋₁ censored transaction statistics
+- L₋₂ censored transaction statistics
+- Censorship rates and percentages
+- Annual bandwidth metrics
 
-### Analyze Results
+**Saved File:**
+- `results/proper_focil_analysis.parquet` - Complete analysis data
 
-After processing, generate visualizations and reports:
-
-```bash
-python analyze_results.py
-```
-
-This creates:
-- `results/figures/il_metrics_analysis.png`
-- `results/figures/bandwidth_savings.png`
-- `results/figures/nonce_replacements.png`
-- `results/summary_report.md`
-
-### Analyze Specific Metric
-
-```bash
-python analyze_results.py --analysis il
-python analyze_results.py --analysis bandwidth
-python analyze_results.py --analysis replacements
+**Load and analyze:**
+```python
+import pandas as pd
+df = pd.read_parquet('results/proper_focil_analysis.parquet')
+print(df.columns)
+# ['block_number', 'block_timestamp', 'base_fee', 'included_tx_count',
+#  'L0_tx_count', 'L0_size_bytes',
+#  'L1_tx_count', 'L1_size_bytes', 'L1_censored_tx_count', ...
+#  'L2_tx_count', 'L2_size_bytes', 'L2_censored_tx_count', ...]
 ```
 
 ## Research Questions Answered
 
-### 1. What are the characteristics of Inclusion Lists?
+### 1. What transactions are censored on Ethereum?
 
-**Query:** `block_il_metrics.sql`
+**Script:** `proper_focil_analysis.py`
 
-**Metrics:**
-- IL transaction count per block
-- IL size in bytes (bandwidth)
-- Average time offset from block timestamp
-- Fee distribution of IL transactions
+**Censorship Detection Criteria:**
+- FOCIL-valid: max_fee >= block base_fee
+- Competitive priority fee: >= 25th percentile of mempool transactions
+- Sufficient dwell time: >= 12 seconds in mempool
+- NOT replaced by user (nonce replacement check)
+- Still in mempool (not included in block)
 
-**Key Insights:**
-- How many transactions fall within the [-4s, +8s] window?
-- What's the typical IL size?
-- Are transactions clustered before or after block time?
+**Key Findings:**
+- ~4.8% of blocks contain censored transactions
+- Average 0.2 censored transactions per block
+- ~45% of mempool transactions are user replacements (must be excluded)
 
-### 2. How much bandwidth can 2-slot ILs save?
+### 2. How do delayed inclusion lists (L₋₁, L₋₂) differ from L₀?
 
-**Query:** `bandwidth_analysis.sql`
+**Implementation:**
+- **L₀**: Contains highest-fee transactions from current block time window
+- **L₋₁**: Contains ONLY transactions censored at block N-1
+- **L₋₂**: Contains ONLY transactions censored at block N-2
 
-**Metrics:**
-- 1-slot IL size vs 2-slot IL size
-- Number of transactions already included (waste)
-- Effective bandwidth (size - waste)
-- Percentage savings
+**Key Findings:**
+- L₋₁ and L₋₂ are much smaller than L₀ (only censored subset)
+- Minimal overlap between censored transactions and highest-fee transactions
+- Censored transaction lists have different purpose than highest-fee lists
 
-**Key Insights:**
-- Is using previous block's IL more efficient?
-- What % of 1-slot IL transactions get included anyway?
-- Cumulative bandwidth savings over time
+### 3. How common are nonce-based transaction replacements?
 
-### 3. How common are transaction replacements?
+**Detection Logic:**
+```python
+# Group by (sender, nonce)
+# Rank by fee (highest first)
+# All but highest-fee transaction = replaced
+```
 
-**Query:** `nonce_replacements.sql`
+**Key Findings:**
+- 45% of mempool transactions are user replacements
+- Critical to exclude from censorship detection
+- Prevents false positive censorship flags
 
-**Metrics:**
-- Number of replacements per (sender, nonce)
-- Fee increase (multiplier)
-- Time between replacements
-- Unique senders using RBF
+## FOCIL Methodology
 
-**Key Insights:**
-- How often do users replace transactions?
-- What's the typical fee bump?
-- How quickly do replacements happen?
-
-### 4. How prevalent is transaction censorship?
-
-**Query:** `censorship_events.sql`
-
-**Metrics:**
-- Transactions pending >N blocks with competitive fees
-- Confidence score based on fee percentiles
-- Time in mempool vs block inclusion
-
-**Key Insights:**
-- How many high-fee transactions are delayed?
-- What's the distribution of pending times?
-- Are there patterns in censorship?
-
-## Data Flow Details
-
-### Time Window Logic
+### Censorship Detection Logic
 
 ```python
-# From handwritten notes: [-4, +8] seconds
-block_timestamp = block.timestamp
-window_start = block_timestamp - 4 seconds
-window_end = block_timestamp + 8 seconds
+# Step 1: Calculate 25th percentile from mempool txs before block
+percentile_25 = mempool_txs[
+    (seen_timestamp >= block_timestamp - 30) &
+    (seen_timestamp <= block_timestamp)
+]['priority_fee'].quantile(0.25)
 
-# Filter mempool transactions
-included_in_il = (
-    tx.seen_timestamp >= window_start AND
-    tx.seen_timestamp <= window_end AND
-    tx.max_fee >= block.base_fee AND
-    tx NOT in block.transactions
-)
+# Step 2: Calculate transaction lifecycle
+tx_lifecycle = mempool.groupby('tx_hash').agg({
+    'seen_timestamp': ['min', 'max'],  # first_seen, last_seen
+    'max_fee': 'first',
+    'priority_fee': 'first',
+    'tx_size': 'first'
+})
+
+# Step 3: Flag censored transactions
+censored = tx_lifecycle[
+    (max_fee >= base_fee) &                      # FOCIL-valid
+    (priority_fee >= percentile_25) &            # Competitive fee
+    (first_seen < block_timestamp) &             # Seen before block
+    ((block_timestamp - first_seen) >= 12) &     # Dwell time >= 12s
+    (~tx_hash.isin(replaced_txs)) &              # NOT user replacement
+    (last_seen >= block_timestamp - 12)          # Still in mempool
+]
 ```
 
-### Nonce Replacement Logic
+### Nonce Replacement Detection
 
-```sql
--- Find highest-fee tx per (sender, nonce)
-ROW_NUMBER() OVER (
-    PARTITION BY sender, nonce
-    ORDER BY max_fee DESC
-) as fee_rank
+```python
+# Group by (sender, nonce)
+grouped = mempool.groupby(['sender', 'nonce'])
 
--- fee_rank = 1 is the final transaction
--- fee_rank > 1 are replaced transactions
+for (sender, nonce), group in grouped:
+    if len(group) > 1:
+        # Sort by fee (highest first)
+        sorted_group = group.sort_values('max_fee', ascending=False)
+        # First tx = final version
+        # Rest = replaced (exclude from censorship)
+        replaced_hashes.extend(sorted_group.iloc[1:]['tx_hash'])
 ```
 
-### Bandwidth Calculation
+### L₀, L₋₁, L₋₂ Construction
 
-```
-effective_bandwidth = il_size - already_included_bytes
+```python
+# L₀: Highest-fee transactions from current block window
+L0 = construct_il(mempool_window_N, base_fee_N)
 
-savings = 2_slot_effective - 1_slot_effective
-savings_pct = (savings / 1_slot_effective) * 100
+# L₋₁: ONLY censored transactions from N-1
+censored_N1 = flag_censored_transactions(mempool, block_timestamp_N1, base_fee_N1)
+L1 = construct_censored_il(censored_N1)
+
+# L₋₂: ONLY censored transactions from N-2
+censored_N2 = flag_censored_transactions(mempool, block_timestamp_N2, base_fee_N2)
+L2 = construct_censored_il(censored_N2)
 ```
 
 ## Performance
@@ -305,22 +302,30 @@ For 5 years of data (~40M blocks):
 
 ## Output Files
 
-### Parquet Files
+### Main Result File
 
-- `block_il_metrics_<start>_<end>_<timestamp>.parquet`
-- `nonce_replacements_<start>_<end>_<timestamp>.parquet`
-- `bandwidth_analysis_<start>_<end>_<timestamp>.parquet`
-- `censorship_events_<start>_<end>_<timestamp>.parquet` (optional)
+`results/proper_focil_analysis.parquet` contains:
 
-### Figures
+**Per-block metrics:**
+- `block_number`, `block_timestamp`, `base_fee`, `included_tx_count`
 
-- `il_metrics_analysis.png` - IL size, distribution, time offsets
-- `bandwidth_savings.png` - 1-slot vs 2-slot comparison
-- `nonce_replacements.png` - Fee increases, replacement timing
+**L₀ (highest-fee IL):**
+- `L0_tx_count`, `L0_size_bytes`
 
-### Reports
+**L₋₁ (censored txs from N-1):**
+- `L1_tx_count` - Number of censored txs in IL (after 8 KiB cap)
+- `L1_size_bytes` - Size of censored tx IL
+- `L1_censored_tx_count` - Total censored txs detected
+- `L0_L1_intersection_count` - Overlap with L₀
+- `L0_L1_intersection_bytes` - Overlap size
+- `L1_effective_bytes` - Bandwidth after deduplication
+- `L1_bandwidth_saved` - Bytes saved
+- `L1_savings_pct` - Savings percentage
 
-- `summary_report.md` - Key statistics and findings
+**L₋₂ (censored txs from N-2):**
+- `L2_tx_count`, `L2_size_bytes`, `L2_censored_tx_count`
+- `L0_L2_intersection_count`, `L0_L2_intersection_bytes`
+- `L2_effective_bytes`, `L2_bandwidth_saved`, `L2_savings_pct`
 
 ## Advanced Usage
 
@@ -422,12 +427,22 @@ This analysis processes **5 years** of Ethereum mempool data (blocks **15,537,39
 
 ### Key Findings
 
-*[Fill in after running analysis]*
+From analysis of blocks 21,575,000 - 21,575,497 (Jan 2025):
 
-- Average IL size: **X** transactions, **Y** KB
-- Bandwidth savings (2-slot vs 1-slot): **Z**%
-- Transaction replacement rate: **N**%
-- Censorship detection rate: **M**%
+**Censorship Detection:**
+- **4.8%** of blocks contained censored transactions
+- **0.2** censored transactions per block on average
+- **45%** of mempool transactions are user replacements (must be excluded)
+
+**Inclusion List Sizes:**
+- **L₀**: 6.26 KiB average (16.0 transactions)
+- **L₋₁**: 0.02 KiB average (0.1 transactions) - censored only
+- **L₋₂**: 0.02 KiB average (0.1 transactions) - censored only
+
+**Overlap:**
+- **0.0%** overlap between L₀ and L₋₁/L₋₂
+- Censored transactions are NOT the highest-fee transactions
+- This validates the research methodology distinction
 
 ### Visualizations
 

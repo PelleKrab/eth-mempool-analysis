@@ -1,131 +1,90 @@
-# Quick Start Guide
+# FOCIL Censorship Analysis - Quick Start
 
-Get up and running in 5 minutes!
+## What This Does
 
-## Step 1: Install Dependencies (30 seconds)
+Analyzes Ethereum transaction censorship using the **correct FOCIL research methodology**:
 
-```bash
-cd ~/eth-mempool-analysis
-pip install -r requirements.txt
-```
+- **L₀**: Highest-fee transactions from current block
+- **L₋₁**: ONLY censored transactions from N-1 block
+- **L₋₂**: ONLY censored transactions from N-2 block
+- **Nonce replacement tracking**: Excludes user replacements (~45% of transactions!)
 
-## Step 2: Configure ClickHouse (1 minute)
-
-Edit `config/config.yaml`:
+## Run Analysis
 
 ```bash
-nano config/config.yaml
+cd ~/eth-mempool-analysis/scripts
+python proper_focil_analysis.py
 ```
 
-Update your ClickHouse credentials:
-```yaml
-clickhouse:
-  url: "https://your-server.com:8123"
-  user: "your_username"
-  password: "your_password"
+**That's it!** The script will:
+1. Detect nonce replacements
+2. Flag censored transactions
+3. Build L₀, L₋₁, L₋₂ inclusion lists
+4. Calculate metrics and save results
+
+## Configure Block Range
+
+Edit `proper_focil_analysis.py` lines 396-398:
+
+```python
+start_block = 21575000
+end_block = 21575500    # Change to your desired range
+batch_size = 100        # Blocks per batch
 ```
 
-## Step 3: Test on Small Sample (2 minutes)
+## Output
 
-Process just 1 week of data to verify everything works:
+**Console summary:**
+- Blocks analyzed
+- Censorship statistics
+- IL sizes and overlap metrics
+- Bandwidth calculations
 
-```bash
-cd scripts
-python batch_processor.py --start-block 15537394 --end-block 15587394 --batch-size 10000
+**Saved file:**
+- `results/proper_focil_analysis.parquet`
+
+## View Results
+
+```python
+import pandas as pd
+df = pd.read_parquet('results/proper_focil_analysis.parquet')
+
+# Censorship statistics
+print(f"Avg censored at N-1: {df['L1_censored_tx_count'].mean():.2f}")
+print(f"Blocks with censorship: {(df['L1_censored_tx_count'] > 0).sum()}")
+
+# View censored blocks
+df[df['L1_censored_tx_count'] > 0][['block_number', 'L1_censored_tx_count']]
 ```
 
-You should see:
-```
-Connecting to ClickHouse...
-Processing batch: 15537394 to 15547394
-✓ Batch completed successfully
-```
+## Key Results (Jan 2025)
 
-## Step 4: Analyze Results (1 minute)
+From 500 block sample:
+- **4.8%** of blocks had censored transactions
+- **0.2** censored txs per block average
+- **45%** of mempool txs are user replacements
+- **0.0%** overlap between censored and highest-fee txs
 
-```bash
-python analyze_results.py
-```
+## Understanding Results
 
-Check output:
-- `../results/figures/` - PNG visualizations
-- `../results/summary_report.md` - Summary statistics
+**Q: Why is L₋₁/L₋₂ so small?**
+A: They contain ONLY censored transactions, not all high-fee transactions.
 
-## Step 5: Run Full Analysis
+**Q: Why track nonce replacements?**
+A: Without this, we'd falsely flag 45% of transactions as censored.
 
-Once you've verified it works, process all 5 years:
+**Q: Why no overlap with L₀?**
+A: Censored txs have competitive fees (≥25th percentile) but aren't the highest-fee transactions.
 
-```bash
-python batch_processor.py
-```
+## Files Cleaned Up
 
-This will take 6-30 hours. You can monitor progress in the logs.
+The following used **incorrect methodology** and were removed:
+- ❌ `scripts/focil_bandwidth_analysis.py` - assumed overlap rates
+- ❌ `queries/bandwidth_analysis.sql` - didn't detect censorship
+- ❌ `queries/focil_delay_analysis.sql` - didn't detect censorship
 
-## Pro Tips
+Old results: `results/archive_old_methodology/`
 
-### Run in Background
+## Reference
 
-```bash
-nohup python batch_processor.py > batch.log 2>&1 &
-tail -f batch.log
-```
-
-### Resume Failed Batches
-
-The system automatically skips completed batches if files exist. Just re-run:
-
-```bash
-python batch_processor.py
-```
-
-### Export Specific Queries Only
-
-```bash
-# Only run bandwidth analysis
-python batch_processor.py --query bandwidth
-```
-
-### View Results Without Running Analysis
-
-```bash
-# Load parquet files directly
-python
->>> import pandas as pd
->>> df = pd.read_parquet('../results/block_il_metrics_*.parquet')
->>> df.head()
-```
-
-## Troubleshooting
-
-**ClickHouse connection failed?**
-```bash
-# Test connection manually
-clickhouse-client --host=your-host --user=user --password=pass
-```
-
-**Out of memory?**
-```bash
-# Use smaller batches
-python batch_processor.py --batch-size 50000
-```
-
-**Want to process specific date range?**
-```bash
-# Blocks ~7200 per day, so:
-# Jan 2023 = block ~16_300_000
-# Dec 2024 = block ~20_900_000
-python batch_processor.py --start-block 16300000 --end-block 20900000
-```
-
-## What's Next?
-
-1. **Read README.md** for full documentation
-2. **Modify SQL queries** in `queries/` for custom analysis
-3. **Create Jupyter notebooks** in `notebooks/` for interactive exploration
-4. **Share results** - export figures for your research paper
-
-## Need Help?
-
-- Check the logs: `logs/analysis.log`
-- Review the queries: `queries/*.sql`
-- Open an issue on GitHub
+Research spec: https://hackmd.io/@pellekrab/HkzMiXkmZe
