@@ -1,71 +1,73 @@
 -- Censorship Event Detection
 -- Identifies transactions that should have been included but weren't
 -- Parameters: {start_block}, {end_block}, {min_pending_blocks}, {window_start_secs}, {window_end_secs}
+--
+-- NOTE: Simplified version - we can't definitively check if a tx was included in a specific block
+-- since we don't have transaction hashes per block. This version identifies txs that appeared
+-- in mempool and stayed pending across multiple blocks.
 
 WITH tx_first_seen AS (
     -- Track when each tx first appeared in mempool
     SELECT
-        tx_hash,
-        sender,
+        hash as tx_hash,
+        `from` as sender,
         nonce,
-        toUInt256(max_fee_per_gas) as max_fee,
-        toUInt256(tip) as priority_fee,
-        min(seen_timestamp) as first_seen
+        toUInt256(gas_fee_cap) as max_fee,
+        toUInt256(gas_tip_cap) as priority_fee,
+        min(event_date_time) as first_seen
     FROM mempool_transaction
-    GROUP BY tx_hash, sender, nonce, max_fee_per_gas, tip
+    GROUP BY hash, `from`, nonce, gas_fee_cap, gas_tip_cap
 ),
 block_fee_percentiles AS (
     -- Calculate fee percentiles per block
     SELECT
-        block_number,
-        block_timestamp,
-        base_fee_per_gas,
-        quantile(0.25)(toFloat64(m.tip)) as p25_fee,
-        quantile(0.50)(toFloat64(m.tip)) as p50_fee,
-        quantile(0.75)(toFloat64(m.tip)) as p75_fee
+        b.execution_payload_block_number as block_number,
+        b.slot_start_date_time as block_timestamp,
+        b.execution_payload_base_fee_per_gas as base_fee_per_gas,
+        quantile(0.25)(toFloat64(m.gas_tip_cap)) as p25_fee,
+        quantile(0.50)(toFloat64(m.gas_tip_cap)) as p50_fee,
+        quantile(0.75)(toFloat64(m.gas_tip_cap)) as p75_fee
     FROM canonical_beacon_block b
-    LEFT JOIN mempool_transaction m ON
-        m.seen_timestamp >= b.block_timestamp - INTERVAL 30 SECOND AND
-        m.seen_timestamp <= b.block_timestamp
-    WHERE b.block_number >= {start_block}
-      AND b.block_number < {end_block}
-    GROUP BY block_number, block_timestamp, base_fee_per_gas
+    GLOBAL CROSS JOIN mempool_transaction m
+    WHERE b.execution_payload_block_number >= {start_block}
+      AND b.execution_payload_block_number < {end_block}
+      AND m.event_date_time >= addSeconds(b.slot_start_date_time, -30)
+      AND m.event_date_time <= b.slot_start_date_time
+    GROUP BY
+        b.execution_payload_block_number,
+        b.slot_start_date_time,
+        b.execution_payload_base_fee_per_gas
 ),
 pending_txs AS (
     -- Find txs that were pending during each block
     SELECT
-        b.block_number,
-        b.block_timestamp,
-        b.base_fee_per_gas,
-        b.transactions,
+        b.execution_payload_block_number as block_number,
+        b.slot_start_date_time as block_timestamp,
+        b.execution_payload_base_fee_per_gas as base_fee_per_gas,
         t.tx_hash,
         t.sender,
         t.priority_fee,
         t.max_fee,
         t.first_seen,
-        dateDiff('second', t.first_seen, b.block_timestamp) as seconds_pending,
-        -- Count how many blocks this tx has been pending
-        (SELECT count(*)
-         FROM canonical_beacon_block b2
-         WHERE b2.block_timestamp >= t.first_seen
-           AND b2.block_timestamp <= b.block_timestamp
-        ) as blocks_pending,
+        dateDiff('second', t.first_seen, b.slot_start_date_time) as seconds_pending,
+        -- Approximate blocks pending (12 seconds per block)
+        toInt64(seconds_pending / 12) as blocks_pending,
         -- Check if in time window
         if(
-            t.first_seen >= b.block_timestamp + INTERVAL {window_start_secs} SECOND AND
-            t.first_seen <= b.block_timestamp + INTERVAL {window_end_secs} SECOND,
+            t.first_seen >= addSeconds(b.slot_start_date_time, {window_start_secs}) AND
+            t.first_seen <= addSeconds(b.slot_start_date_time, {window_end_secs}),
             1, 0
         ) as in_time_window
     FROM canonical_beacon_block b
-    CROSS JOIN tx_first_seen t
-    WHERE b.block_number >= {start_block}
-      AND b.block_number < {end_block}
+    GLOBAL CROSS JOIN tx_first_seen t
+    WHERE b.execution_payload_block_number >= {start_block}
+      AND b.execution_payload_block_number < {end_block}
       -- Tx must have been seen before the block
-      AND t.first_seen < b.block_timestamp
-      -- Tx not included in this block
-      AND NOT arrayExists(x -> x = t.tx_hash, b.transactions)
+      AND t.first_seen < b.slot_start_date_time
       -- Tx meets base fee requirement
-      AND t.max_fee >= b.base_fee_per_gas
+      AND t.max_fee >= b.execution_payload_base_fee_per_gas
+      -- Only look at txs that were pending for a reasonable time
+      AND seconds_pending >= 12
 )
 SELECT
     p.block_number,

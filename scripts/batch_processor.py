@@ -25,6 +25,7 @@ class MempoolBatchProcessor:
         """Initialize the processor with configuration"""
         self.config = self._load_config(config_path)
         self._setup_logging()
+        self.http_mode = False  # Will be set by _init_clickhouse
         self.client = self._init_clickhouse()
         self.queries_dir = Path(__file__).parent.parent / "queries"
         self.results_dir = Path(self.config['output']['results_dir'])
@@ -57,23 +58,45 @@ class MempoolBatchProcessor:
         ch_config = self.config['clickhouse']
         self.logger.info(f"Connecting to ClickHouse at {ch_config['url']}")
 
-        # Parse URL to extract host and port
-        url = ch_config['url'].replace('https://', '').replace('http://', '')
-        if ':' in url:
-            host, port = url.split(':')
-            port = int(port)
-        else:
-            host = url
-            port = 9000  # Native protocol port
+        # Parse URL to extract host, port, and protocol
+        url = ch_config['url']
+        use_https = url.startswith('https://')
 
-        return Client(
-            host=host,
-            port=port,
-            user=ch_config['user'],
-            password=ch_config['password'],
-            database=ch_config['database'],
-            settings={'max_execution_time': 3600}  # 1 hour timeout
-        )
+        # Remove protocol prefix
+        url_clean = url.replace('https://', '').replace('http://', '')
+
+        # Extract host and port
+        if ':' in url_clean:
+            host, port_str = url_clean.split(':')
+            port = int(port_str)
+        else:
+            host = url_clean
+            # Use HTTP port by default for HTTPS URLs
+            port = 8123 if use_https else 9000
+
+        # For HTTPS connections, we need to use the HTTP interface
+        if use_https or port == 8123:
+            # Use requests-based connection for HTTP/HTTPS
+            import requests
+            self.logger.info(f"Using HTTP(S) connection to {host}:{port}")
+
+            # We'll need to use a different approach - execute queries via HTTP
+            # Store connection params for HTTP queries
+            self.http_mode = True
+            self.http_url = ch_config['url']
+            self.http_auth = (ch_config['user'], ch_config['password'])
+            return None  # No native client for HTTP mode
+        else:
+            # Use native protocol
+            self.http_mode = False
+            return Client(
+                host=host,
+                port=port,
+                user=ch_config['user'],
+                password=ch_config['password'],
+                database=ch_config['database'],
+                settings={'max_execution_time': 3600}  # 1 hour timeout
+            )
 
     def _load_query(self, query_name: str) -> str:
         """Load SQL query from file"""
@@ -86,25 +109,58 @@ class MempoolBatchProcessor:
 
     def _execute_query(self, query: str, params: Dict) -> pd.DataFrame:
         """Execute ClickHouse query and return as DataFrame"""
+        import requests
+        import io
+
         # Replace parameters in query
         for key, value in params.items():
             query = query.replace(f"{{{key}}}", str(value))
 
         self.logger.debug(f"Executing query:\n{query[:200]}...")
 
-        # Execute and fetch results
-        result = self.client.execute(query, with_column_types=True)
-        data, columns = result
+        if self.http_mode:
+            # Execute via HTTP interface
+            # Format: CSV with header for easy pandas parsing
+            query_with_format = query + " FORMAT CSVWithNames"
 
-        if not data:
-            self.logger.warning("Query returned no results")
-            return pd.DataFrame()
+            try:
+                response = requests.post(
+                    self.http_url,
+                    auth=self.http_auth,
+                    data=query_with_format.encode('utf-8'),
+                    params={'database': self.config['clickhouse']['database']},
+                    timeout=3600
+                )
 
-        # Convert to DataFrame
-        column_names = [col[0] for col in columns]
-        df = pd.DataFrame(data, columns=column_names)
+                if response.status_code != 200:
+                    raise Exception(f"HTTP {response.status_code}: {response.text}")
 
-        return df
+                # Parse CSV response
+                if len(response.content) == 0:
+                    self.logger.warning("Query returned no results")
+                    return pd.DataFrame()
+
+                df = pd.read_csv(io.StringIO(response.text))
+                return df
+
+            except Exception as e:
+                self.logger.error(f"Query failed: {e}")
+                raise
+
+        else:
+            # Execute via native protocol
+            result = self.client.execute(query, with_column_types=True)
+            data, columns = result
+
+            if not data:
+                self.logger.warning("Query returned no results")
+                return pd.DataFrame()
+
+            # Convert to DataFrame
+            column_names = [col[0] for col in columns]
+            df = pd.DataFrame(data, columns=column_names)
+
+            return df
 
     def _save_results(self, df: pd.DataFrame, name: str, batch_id: Optional[str] = None):
         """Save results to Parquet/CSV"""
@@ -136,15 +192,69 @@ class MempoolBatchProcessor:
         """Process inclusion list metrics for a block range"""
         self.logger.info(f"Processing IL metrics for blocks {start_block} to {end_block}")
 
-        query = self._load_query("block_il_metrics")
-        params = {
+        # Step 1: Get blocks
+        self.logger.info("  Fetching block data...")
+        blocks_query = self._load_query("block_il_metrics")
+        blocks_df = self._execute_query(blocks_query, {
             'start_block': start_block,
-            'end_block': end_block,
-            'window_start_secs': self.config['analysis']['time_window_start_secs'],
-            'window_end_secs': self.config['analysis']['time_window_end_secs']
-        }
+            'end_block': end_block
+        })
 
-        df = self._execute_query(query, params)
+        if blocks_df.empty:
+            self.logger.warning("No blocks found in range")
+            return pd.DataFrame()
+
+        # Step 2: Calculate time range for mempool query
+        window_start = self.config['analysis']['time_window_start_secs']
+        window_end = self.config['analysis']['time_window_end_secs']
+
+        # Add buffer to time range
+        min_timestamp = blocks_df['block_timestamp'].min() + window_start - 2
+        max_timestamp = blocks_df['block_timestamp'].max() + window_end + 2
+
+        self.logger.info(f"  Fetching mempool data from {min_timestamp} to {max_timestamp}...")
+
+        # Step 3: Get mempool transactions in time range
+        mempool_query = self._load_query("mempool_time_range")
+        mempool_df = self._execute_query(mempool_query, {
+            'start_timestamp': int(min_timestamp),
+            'end_timestamp': int(max_timestamp)
+        })
+
+        self.logger.info(f"  Got {len(blocks_df)} blocks and {len(mempool_df)} mempool txs")
+
+        # Step 4: Join and analyze in pandas
+        self.logger.info("  Analyzing IL metrics...")
+        results = []
+
+        for _, block in blocks_df.iterrows():
+            block_ts = block['block_timestamp']
+            base_fee = int(block['base_fee'])
+
+            # Filter mempool txs in time window
+            window_mask = (
+                (mempool_df['seen_timestamp'] >= block_ts + window_start) &
+                (mempool_df['seen_timestamp'] <= block_ts + window_end) &
+                (mempool_df['max_fee'].astype('Int64') >= base_fee)
+            )
+            window_txs = mempool_df[window_mask]
+
+            results.append({
+                'block_number': block['block_number'],
+                'block_timestamp': block_ts,
+                'base_fee': str(base_fee),
+                'included_tx_count': block['included_tx_count'],
+                'gas_used': block['gas_used'],
+                'gas_limit': block['gas_limit'],
+                'time_window_tx_count': len(window_txs),
+                'il_tx_count': len(window_txs),
+                'il_size_bytes': len(window_txs) * 200,  # Estimate
+                'avg_time_offset_secs': (window_txs['seen_timestamp'] - block_ts).mean() if len(window_txs) > 0 else None,
+                'avg_priority_fee': window_txs['priority_fee'].astype(float).mean() if len(window_txs) > 0 else None,
+                'median_priority_fee': window_txs['priority_fee'].astype(float).median() if len(window_txs) > 0 else None
+            })
+
+        df = pd.DataFrame(results)
         self._save_results(df, "block_il_metrics", f"{start_block}_{end_block}")
 
         return df
@@ -275,18 +385,32 @@ def main():
         processor.config['analysis']['batch_size_blocks'] = args.batch_size
 
     if args.query:
-        # Run specific query
-        start = processor.config['analysis']['start_block']
-        end = processor.config['analysis']['end_block']
+        # Run specific query in batches
+        start_block = processor.config['analysis']['start_block']
+        end_block = processor.config['analysis']['end_block']
+        batch_size = processor.config['analysis']['batch_size_blocks']
 
-        if args.query == 'il_metrics':
-            processor.process_block_il_metrics(start, end)
-        elif args.query == 'replacements':
-            processor.process_nonce_replacements(start, end)
-        elif args.query == 'bandwidth':
-            processor.process_bandwidth_analysis(start, end)
-        elif args.query == 'censorship':
-            processor.process_censorship_events(start, end)
+        total_blocks = end_block - start_block
+        num_batches = (total_blocks + batch_size - 1) // batch_size
+
+        processor.logger.info(f"Running {args.query} from block {start_block} to {end_block}")
+        processor.logger.info(f"Batch size: {batch_size} blocks, Total batches: {num_batches}\n")
+
+        with tqdm(total=num_batches, desc=f"Processing {args.query}") as pbar:
+            for i in range(num_batches):
+                batch_start = start_block + (i * batch_size)
+                batch_end = min(batch_start + batch_size, end_block)
+
+                if args.query == 'il_metrics':
+                    processor.process_block_il_metrics(batch_start, batch_end)
+                elif args.query == 'replacements':
+                    processor.process_nonce_replacements(batch_start, batch_end)
+                elif args.query == 'bandwidth':
+                    processor.process_bandwidth_analysis(batch_start, batch_end)
+                elif args.query == 'censorship':
+                    processor.process_censorship_events(batch_start, batch_end)
+
+                pbar.update(1)
     else:
         # Run full analysis
         processor.run_full_analysis()

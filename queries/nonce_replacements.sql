@@ -4,20 +4,20 @@
 
 WITH ranked_txs AS (
     SELECT
-        sender,
+        `from` as sender,
         nonce,
-        tx_hash,
-        toUInt256(max_fee_per_gas) as max_fee,
-        toUInt256(tip) as priority_fee,
-        seen_timestamp,
+        hash as tx_hash,
+        toUInt256(gas_fee_cap) as max_fee,
+        toUInt256(gas_tip_cap) as priority_fee,
+        event_date_time as seen_timestamp,
         ROW_NUMBER() OVER (
-            PARTITION BY sender, nonce
-            ORDER BY toUInt256(max_fee_per_gas) DESC, seen_timestamp DESC
+            PARTITION BY `from`, nonce
+            ORDER BY toUInt256(gas_fee_cap) DESC, event_date_time DESC
         ) as fee_rank,
-        COUNT(*) OVER (PARTITION BY sender, nonce) as version_count
+        COUNT(*) OVER (PARTITION BY `from`, nonce) as version_count
     FROM mempool_transaction
-    WHERE seen_timestamp >= toDateTime({start_timestamp})
-      AND seen_timestamp < toDateTime({end_timestamp})
+    WHERE event_date_time >= toDateTime({start_timestamp})
+      AND event_date_time < toDateTime({end_timestamp})
 ),
 replacements AS (
     SELECT
@@ -50,6 +50,6 @@ SELECT
     toUnixTimestamp(final_timestamp) as final_timestamp,
     toString(fee_increase) as fee_increase,
     toFloat64(final_max_fee) / toFloat64(original_max_fee) as fee_multiplier,
-    dateDiff('second', original_timestamp, final_timestamp) as replacement_time_secs
+    toUnixTimestamp(final_timestamp) - toUnixTimestamp(original_timestamp) as replacement_time_secs
 FROM replacements
 ORDER BY final_timestamp
