@@ -1,29 +1,36 @@
 #!/usr/bin/env python3
 """
-Proper FOCIL Analysis - Correct Censorship Detection Methodology
+FOCIL Censorship Analysis
 
-IMPORTANT: This implements the CORRECT research methodology where:
-- L₀: Contains HIGHEST-FEE transactions from current block time window
-- L₋₁: Contains ONLY CENSORED transactions from N-1 block
-- L₋₂: Contains ONLY CENSORED transactions from N-2 block
+Analyzes Ethereum transaction censorship patterns using Fork-Choice enforced
+Inclusion Lists (FOCIL) methodology. Constructs three types of inclusion lists
+per block and calculates overlap metrics for bandwidth analysis.
 
-Censorship Detection Criteria:
-1. FOCIL-valid: max_fee >= base_fee
-2. Competitive priority fee: >= 25th percentile of mempool transactions
-3. Sufficient dwell time: >= 12 seconds in mempool
-4. NOT replaced by user (nonce replacement check)
-5. Still in mempool (not included in block)
+Inclusion List Types:
+  L₀: Top-N highest priority fee transactions from current block time window
+  L₋₁: Transactions flagged as censored at block N-1
+  L₋₂: Transactions flagged as censored at block N-2
 
-Nonce Replacement Detection:
-- Groups transactions by (sender, nonce)
-- Highest-fee transaction = final version
-- All others = replaced (excluded from censorship flagging)
+Censorship Detection:
+  Transactions are flagged as censored when they meet the following criteria:
+  1. FOCIL-valid (max_fee >= base_fee)
+  2. Competitive priority fee (>= 25th percentile of mempool transactions)
+  3. Sufficient dwell time (>= 12 seconds in mempool)
+  4. Not replaced by user via nonce replacement
+  5. Remain in mempool (not included in block)
 
-EIP-7805 Compliance:
-- 8 KiB size cap per inclusion list
-- Sorted by priority fee (highest first)
+Nonce Replacement Handling:
+  To avoid false positives, transactions replaced by users are excluded from
+  censorship detection. Replacements are identified by grouping transactions
+  by (sender, nonce) and treating the highest-fee transaction as final.
 
-Reference: https://hackmd.io/@pellekrab/HkzMiXkmZe
+Implementation:
+  - EIP-7805 compliant (8 KiB size cap per inclusion list)
+  - Transactions sorted by priority fee (descending)
+  - Results saved in Parquet format for analysis
+
+Reference:
+  https://hackmd.io/@pellekrab/HkzMiXkmZe
 """
 
 import pandas as pd
@@ -406,15 +413,15 @@ def main():
     config = load_config()
 
     print("="*70)
-    print("PROPER FOCIL ANALYSIS (EIP-7805 Compliant)")
+    print("FOCIL CENSORSHIP ANALYSIS")
     print("="*70)
-    print(f"Max IL size: {MAX_IL_BYTES:,} bytes ({MAX_IL_BYTES/1024:.1f} KiB)")
+    print(f"Inclusion list size cap: {MAX_IL_BYTES:,} bytes ({MAX_IL_BYTES/1024:.1f} KiB)")
     print(f"Time window: {config['analysis']['time_window_start_secs']} to {config['analysis']['time_window_end_secs']} seconds")
 
-    # Process in smaller batches to avoid memory issues
-    start_block = 21575000
-    end_block = 21575500  # 500 blocks for better statistics
-    batch_size = 100
+    # Load block range and batch size from configuration
+    start_block = config['analysis']['start_block']
+    end_block = config['analysis']['end_block']
+    batch_size = config['analysis'].get('batch_size_blocks', 100)
 
     all_results = []
 
@@ -432,9 +439,9 @@ def main():
 
     # Save results
     results_dir = Path(__file__).parent.parent / "results"
-    output_file = results_dir / "proper_focil_analysis.parquet"
+    output_file = results_dir / "focil_censorship_analysis.parquet"
     df.to_parquet(output_file, index=False)
-    print(f"\nSaved results to: {output_file}")
+    print(f"\nResults saved to: {output_file}")
 
     # Print summary
     print("\n" + "="*70)
@@ -443,31 +450,31 @@ def main():
 
     print(f"\nBlocks analyzed: {len(df):,}")
 
-    print(f"\n## L₀ (0-delay)")
+    print(f"\n## L₀ (highest-fee transactions)")
     print(f"Average size: {df['L0_size_bytes'].mean()/1024:.2f} KiB")
-    print(f"Average tx count: {df['L0_tx_count'].mean():.1f}")
+    print(f"Average transaction count: {df['L0_tx_count'].mean():.1f}")
 
-    print(f"\n## L₋₁ (1-slot delay) - CENSORED TRANSACTIONS ONLY")
-    print(f"Average censored tx count: {df['L1_censored_tx_count'].mean():.1f}")
-    print(f"Average IL size: {df['L1_size_bytes'].mean()/1024:.2f} KiB")
-    print(f"Average tx in IL: {df['L1_tx_count'].mean():.1f}")
-    print(f"Average overlap with L₀: {df['L0_L1_intersection_bytes'].mean()/1024:.2f} KiB ({df['L1_savings_pct'].mean():.1f}%)")
+    print(f"\n## L₋₁ (censored transactions from N-1)")
+    print(f"Total censored transactions detected: {df['L1_censored_tx_count'].mean():.1f}")
+    print(f"Average inclusion list size: {df['L1_size_bytes'].mean()/1024:.2f} KiB")
+    print(f"Average transactions in IL: {df['L1_tx_count'].mean():.1f}")
+    print(f"Overlap with L₀: {df['L0_L1_intersection_bytes'].mean()/1024:.2f} KiB ({df['L1_savings_pct'].mean():.1f}%)")
     print(f"Effective bandwidth: {df['L1_effective_bytes'].mean()/1024:.2f} KiB")
     print(f"Bandwidth saved: {df['L1_bandwidth_saved'].mean()/1024:.2f} KiB per block")
 
-    print(f"\n## L₋₂ (2-slot delay) - CENSORED TRANSACTIONS ONLY")
-    print(f"Average censored tx count: {df['L2_censored_tx_count'].mean():.1f}")
-    print(f"Average IL size: {df['L2_size_bytes'].mean()/1024:.2f} KiB")
-    print(f"Average tx in IL: {df['L2_tx_count'].mean():.1f}")
-    print(f"Average overlap with L₀: {df['L0_L2_intersection_bytes'].mean()/1024:.2f} KiB ({df['L2_savings_pct'].mean():.1f}%)")
+    print(f"\n## L₋₂ (censored transactions from N-2)")
+    print(f"Total censored transactions detected: {df['L2_censored_tx_count'].mean():.1f}")
+    print(f"Average inclusion list size: {df['L2_size_bytes'].mean()/1024:.2f} KiB")
+    print(f"Average transactions in IL: {df['L2_tx_count'].mean():.1f}")
+    print(f"Overlap with L₀: {df['L0_L2_intersection_bytes'].mean()/1024:.2f} KiB ({df['L2_savings_pct'].mean():.1f}%)")
     print(f"Effective bandwidth: {df['L2_effective_bytes'].mean()/1024:.2f} KiB")
     print(f"Bandwidth saved: {df['L2_bandwidth_saved'].mean()/1024:.2f} KiB per block")
 
-    print(f"\n## Censorship Statistics")
-    print(f"Average censored txs at N-1: {df['L1_censored_tx_count'].mean():.1f}")
-    print(f"Average censored txs at N-2: {df['L2_censored_tx_count'].mean():.1f}")
-    print(f"Blocks with censored txs at N-1: {(df['L1_censored_tx_count'] > 0).sum():,} ({(df['L1_censored_tx_count'] > 0).sum() / len(df) * 100:.1f}%)")
-    print(f"Blocks with censored txs at N-2: {(df['L2_censored_tx_count'] > 0).sum():,} ({(df['L2_censored_tx_count'] > 0).sum() / len(df) * 100:.1f}%)")
+    print(f"\n## Censorship Detection Summary")
+    print(f"Average censored transactions (N-1): {df['L1_censored_tx_count'].mean():.1f}")
+    print(f"Average censored transactions (N-2): {df['L2_censored_tx_count'].mean():.1f}")
+    print(f"Blocks with censorship (N-1): {(df['L1_censored_tx_count'] > 0).sum():,} ({(df['L1_censored_tx_count'] > 0).sum() / len(df) * 100:.1f}%)")
+    print(f"Blocks with censorship (N-2): {(df['L2_censored_tx_count'] > 0).sum():,} ({(df['L2_censored_tx_count'] > 0).sum() / len(df) * 100:.1f}%)")
 
     print(f"\n## Annual Bandwidth (per validator)")
     blocks_per_year = 7200 * 365

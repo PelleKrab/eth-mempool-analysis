@@ -1,90 +1,145 @@
-# FOCIL Censorship Analysis - Quick Start
+# Quick Start Guide
 
-## What This Does
+## Overview
 
-Analyzes Ethereum transaction censorship using the **correct FOCIL research methodology**:
+This guide provides instructions for running the FOCIL censorship analysis on Ethereum historical data.
 
-- **L₀**: Highest-fee transactions from current block
-- **L₋₁**: ONLY censored transactions from N-1 block
-- **L₋₂**: ONLY censored transactions from N-2 block
-- **Nonce replacement tracking**: Excludes user replacements (~45% of transactions!)
+## Running the Analysis
 
-## Run Analysis
+### Execute the Script
 
 ```bash
 cd ~/eth-mempool-analysis/scripts
-python proper_focil_analysis.py
+python focil_censorship_analysis.py
 ```
 
-**That's it!** The script will:
-1. Detect nonce replacements
-2. Flag censored transactions
-3. Build L₀, L₋₁, L₋₂ inclusion lists
-4. Calculate metrics and save results
+The script will process the configured block range and output results to the console and a Parquet file.
 
-## Configure Block Range
+### Configure Block Range
 
-Edit `proper_focil_analysis.py` lines 396-398:
+Edit `config/config.yaml`:
 
-```python
-start_block = 21575000
-end_block = 21575500    # Change to your desired range
-batch_size = 100        # Blocks per batch
+```yaml
+analysis:
+  start_block: 21575000      # Starting block number
+  end_block: 21575500        # Ending block number
+  batch_size_blocks: 100     # Blocks per batch
 ```
+
+Adjust these parameters based on your analysis requirements and available memory.
 
 ## Output
 
-**Console summary:**
-- Blocks analyzed
-- Censorship statistics
-- IL sizes and overlap metrics
-- Bandwidth calculations
+### Console Output
 
-**Saved file:**
-- `results/proper_focil_analysis.parquet`
+The script displays:
+- Block range processed
+- Nonce replacement statistics
+- L₀ inclusion list metrics (highest-fee transactions)
+- L₋₁ inclusion list metrics (censored from N-1)
+- L₋₂ inclusion list metrics (censored from N-2)
+- Censorship detection summary
+- Bandwidth analysis
 
-## View Results
+### Data File
+
+Results are saved to:
+```
+results/focil_censorship_analysis.parquet
+```
+
+## Analyzing Results
+
+### Load Data
 
 ```python
 import pandas as pd
-df = pd.read_parquet('results/proper_focil_analysis.parquet')
 
-# Censorship statistics
-print(f"Avg censored at N-1: {df['L1_censored_tx_count'].mean():.2f}")
-print(f"Blocks with censorship: {(df['L1_censored_tx_count'] > 0).sum()}")
-
-# View censored blocks
-df[df['L1_censored_tx_count'] > 0][['block_number', 'L1_censored_tx_count']]
+df = pd.read_parquet('results/focil_censorship_analysis.parquet')
 ```
 
-## Key Results (Jan 2025)
+### View Summary Statistics
 
-From 500 block sample:
-- **4.8%** of blocks had censored transactions
-- **0.2** censored txs per block average
-- **45%** of mempool txs are user replacements
-- **0.0%** overlap between censored and highest-fee txs
+```python
+# Block coverage
+print(f"Blocks analyzed: {len(df)}")
 
-## Understanding Results
+# Censorship metrics
+print(f"Mean censored (N-1): {df['L1_censored_tx_count'].mean():.2f}")
+print(f"Mean censored (N-2): {df['L2_censored_tx_count'].mean():.2f}")
 
-**Q: Why is L₋₁/L₋₂ so small?**
-A: They contain ONLY censored transactions, not all high-fee transactions.
+# Blocks with censorship
+censored_blocks = df[df['L1_censored_tx_count'] > 0]
+print(f"Blocks with censorship: {len(censored_blocks)}")
+```
 
-**Q: Why track nonce replacements?**
-A: Without this, we'd falsely flag 45% of transactions as censored.
+### Filter Specific Blocks
 
-**Q: Why no overlap with L₀?**
-A: Censored txs have competitive fees (≥25th percentile) but aren't the highest-fee transactions.
+```python
+# Blocks with censorship activity
+censored = df[df['L1_censored_tx_count'] > 0]
+print(censored[['block_number', 'L1_censored_tx_count', 'L2_censored_tx_count']])
+```
 
-## Files Cleaned Up
+## Sample Results
 
-The following used **incorrect methodology** and were removed:
-- ❌ `scripts/focil_bandwidth_analysis.py` - assumed overlap rates
-- ❌ `queries/bandwidth_analysis.sql` - didn't detect censorship
-- ❌ `queries/focil_delay_analysis.sql` - didn't detect censorship
+From blocks 21,575,000 - 21,575,497 (500 block sample):
 
-Old results: `results/archive_old_methodology/`
+**Censorship Statistics:**
+- Blocks with censorship: 24 (4.8%)
+- Mean censored transactions: 0.2 per block
+
+**Nonce Replacements:**
+- Replacement rate: 45% of mempool transactions
+- These are excluded from censorship detection
+
+**Inclusion List Sizes:**
+- L₀ mean: 6.26 KiB (16.0 transactions)
+- L₋₁ mean: 0.02 KiB (0.1 transactions)
+- L₋₂ mean: 0.02 KiB (0.1 transactions)
+
+**Overlap:**
+- L₀ ∩ L₋₁: Approximately 0%
+- L₀ ∩ L₋₂: Approximately 0%
+
+## Interpretation
+
+### Inclusion List Composition
+
+**L₀**: Contains the highest priority fee transactions from the current block time window. This represents the optimal inclusion list without censorship consideration.
+
+**L₋₁ and L₋₂**: Contain only transactions that were flagged as censored at the previous block (N-1) or two blocks prior (N-2). These are typically small as censorship events are relatively infrequent.
+
+### Nonce Replacement Significance
+
+Approximately 45% of mempool transactions are user-initiated replacements (higher fee for same sender and nonce). These must be excluded from censorship detection to avoid false positives.
+
+### Overlap Analysis
+
+The minimal overlap between L₀ and L₋₁/L₋₂ indicates that censored transactions typically have competitive fees (above 25th percentile) but are not among the highest-fee transactions.
+
+## Data Schema
+
+The output file contains the following columns per block:
+
+**Block Metadata:**
+- `block_number`, `block_timestamp`, `base_fee`, `included_tx_count`
+
+**L₀ Metrics:**
+- `L0_tx_count`, `L0_size_bytes`
+
+**L₋₁ Metrics:**
+- `L1_tx_count` - Transactions in inclusion list
+- `L1_size_bytes` - Inclusion list size
+- `L1_censored_tx_count` - Total censored transactions detected
+- `L0_L1_intersection_count` - Overlap count with L₀
+- `L0_L1_intersection_bytes` - Overlap size
+- `L1_effective_bytes` - Net bandwidth after deduplication
+- `L1_bandwidth_saved` - Bandwidth savings
+
+**L₋₂ Metrics:**
+- Analogous to L₋₁ metrics
 
 ## Reference
 
-Research spec: https://hackmd.io/@pellekrab/HkzMiXkmZe
+Research specification: https://hackmd.io/@pellekrab/HkzMiXkmZe
