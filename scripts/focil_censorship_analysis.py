@@ -44,7 +44,6 @@ from tqdm import tqdm
 
 # EIP-7805 Constants
 MAX_IL_BYTES = 8192  # 8 KiB
-AVG_TX_SIZE = 200  # Conservative estimate
 
 
 def load_config():
@@ -92,7 +91,11 @@ def construct_il(mempool_txs: pd.DataFrame, base_fee: int, max_bytes: int = MAX_
     total_size = 0
 
     for idx, tx in valid_txs.iterrows():
-        tx_size = tx['tx_size'] if tx['tx_size'] > 0 else AVG_TX_SIZE
+        # Skip transactions with missing or invalid size data
+        if pd.isna(tx['tx_size']) or tx['tx_size'] <= 0:
+            continue
+
+        tx_size = int(tx['tx_size'])
         if total_size + tx_size <= max_bytes:
             il_txs.append(tx)
             total_size += tx_size
@@ -137,30 +140,30 @@ def flag_censored_transactions(
     block_timestamp: int,
     base_fee: int,
     replaced_txs: set,
-    min_dwell_time_secs: int = 12
+    config: dict
 ) -> pd.DataFrame:
     """
-    Flag transactions as censored based on:
-    - FOCIL-valid (max_fee >= base_fee)
-    - Priority fee >= 25th percentile (user confirmed)
-    - NOT replaced by user (nonce replacement check)
-    - Sufficient dwell time (>=12 seconds)
-    - Still in mempool (not included)
+    Flag transactions as censored based on configured thresholds.
+    All parameters read from config.
     """
     if len(mempool_df) == 0:
         return pd.DataFrame()
 
-    # Step 1: Calculate 25th percentile from mempool txs seen before block
-    # Time window: [block_timestamp - 30, block_timestamp]
+    # Load censorship detection parameters from config
+    min_dwell_time_secs = config['analysis']['censorship_dwell_time_secs']
+    fee_percentile = config['analysis']['censorship_fee_percentile']
+    percentile_window_secs = config['analysis']['censorship_percentile_window_secs']
+
+    # Calculate fee percentile from mempool txs seen before block
     pre_block_txs = mempool_df[
-        (mempool_df['seen_timestamp'] >= block_timestamp - 30) &
+        (mempool_df['seen_timestamp'] >= block_timestamp - percentile_window_secs) &
         (mempool_df['seen_timestamp'] <= block_timestamp)
     ]
 
     if len(pre_block_txs) == 0:
         return pd.DataFrame()
 
-    percentile_25 = pre_block_txs['priority_fee'].quantile(0.25)
+    fee_threshold = pre_block_txs['priority_fee'].quantile(fee_percentile)
 
     # Step 2: For each transaction, calculate dwell time
     # First seen = min(seen_timestamp) for that tx_hash
@@ -174,21 +177,20 @@ def flag_censored_transactions(
     tx_lifecycle.columns = ['tx_hash', 'first_seen', 'last_seen', 'max_fee',
                              'priority_fee', 'tx_size']
 
-    # Step 3: Filter for censored candidates
+    # Filter for censored candidates
     censored = tx_lifecycle[
         # FOCIL-valid
         (tx_lifecycle['max_fee'] >= base_fee) &
         # Competitive priority fee
-        (tx_lifecycle['priority_fee'] >= percentile_25) &
+        (tx_lifecycle['priority_fee'] >= fee_threshold) &
         # First seen before block
         (tx_lifecycle['first_seen'] < block_timestamp) &
-        # Dwell time >= 12 seconds
+        # Sufficient dwell time
         ((block_timestamp - tx_lifecycle['first_seen']) >= min_dwell_time_secs) &
         # NOT replaced by user
         (~tx_lifecycle['tx_hash'].isin(replaced_txs)) &
-        # Still in mempool (last_seen close to or after block timestamp)
-        # This indicates tx wasn't included yet
-        (tx_lifecycle['last_seen'] >= block_timestamp - 12)
+        # Still in mempool (not included yet)
+        (tx_lifecycle['last_seen'] >= block_timestamp - min_dwell_time_secs)
     ]
 
     return censored
@@ -214,7 +216,11 @@ def construct_censored_il(
     total_size = 0
 
     for idx, tx in sorted_txs.iterrows():
-        tx_size = tx['tx_size'] if tx['tx_size'] > 0 else AVG_TX_SIZE
+        # Skip transactions with missing or invalid size data
+        if pd.isna(tx['tx_size']) or tx['tx_size'] <= 0:
+            continue
+
+        tx_size = int(tx['tx_size'])
         if total_size + tx_size <= max_bytes:
             il_txs.append(tx)
             total_size += tx_size
@@ -309,11 +315,11 @@ def analyze_block_range(start_block: int, end_block: int, config: dict):
 
             # Flag censored transactions at block N-1
             L1_censored = flag_censored_transactions(
-                mempool_df=mempool_df,  # Full mempool, not just window
+                mempool_df=mempool_df,
                 block_timestamp=prev_ts,
                 base_fee=prev_base_fee,
                 replaced_txs=replaced_txs_set,
-                min_dwell_time_secs=12
+                config=config
             )
 
             # Construct L₋₁ with ONLY censored transactions
@@ -330,11 +336,11 @@ def analyze_block_range(start_block: int, end_block: int, config: dict):
 
             # Flag censored transactions at block N-2
             L2_censored = flag_censored_transactions(
-                mempool_df=mempool_df,  # Full mempool, not just window
+                mempool_df=mempool_df,
                 block_timestamp=prev2_ts,
                 base_fee=prev2_base_fee,
                 replaced_txs=replaced_txs_set,
-                min_dwell_time_secs=12
+                config=config
             )
 
             # Construct L₋₂ with ONLY censored transactions

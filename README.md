@@ -85,8 +85,14 @@ clickhouse:
   database: "default"
 
 analysis:
+  # Inclusion list time window
   time_window_start_secs: -4
   time_window_end_secs: 8
+
+  # Censorship detection parameters
+  censorship_dwell_time_secs: 12        # Minimum time in mempool (1 slot)
+  censorship_fee_percentile: 0.25       # Fee threshold (25th percentile)
+  censorship_percentile_window_secs: 30 # Time window for percentile calculation
 ```
 
 ## Usage
@@ -232,14 +238,14 @@ Transactions are considered for inclusion if first seen within:
 
 ### Fee Percentile Calculation
 
-The 25th percentile is calculated from mempool transactions observed in:
+Configurable via `censorship_fee_percentile` (default: 0.25). Calculated from mempool transactions observed within the window defined by `censorship_percentile_window_secs` (default: 30 seconds):
 ```
-[block_timestamp - 30 seconds, block_timestamp]
+[block_timestamp - censorship_percentile_window_secs, block_timestamp]
 ```
 
 ### Dwell Time
 
-Minimum dwell time threshold: 12 seconds (approximately 1 slot)
+Configurable via `censorship_dwell_time_secs` (default: 12 seconds, approximately 1 slot)
 
 ### Size Cap
 
