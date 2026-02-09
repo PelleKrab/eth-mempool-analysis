@@ -26,6 +26,7 @@ logs/
 
 # Config with credentials
 config/config.yaml
+.env
 
 # OS
 .DS_Store

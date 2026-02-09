@@ -3,270 +3,582 @@
 FOCIL Censorship Analysis
 
 Analyzes Ethereum transaction censorship patterns using Fork-Choice enforced
-Inclusion Lists (FOCIL) methodology. Constructs three types of inclusion lists
+Inclusion Lists (FOCIL) methodology. Constructs six inclusion list variants
 per block and calculates overlap metrics for bandwidth analysis.
 
-Inclusion List Types:
-  L₀: Top-N highest priority fee transactions from current block time window
-  L₋₁: Transactions flagged as censored at block N-1
-  L₋₂: Transactions flagged as censored at block N-2
+Inclusion List Variants (3 delays x 2 strategies):
+  Top Fee Strategy (highest priority transactions):
+    L0 Top Fee: Highest fee txs from current block window
+    L-1 Top Fee: Highest fee txs from block N-1 window
+    L-2 Top Fee: Highest fee txs from block N-2 window
+
+  Censored Strategy (censorship resistance):
+    L0 Censored: Transactions censored at current block
+    L-1 Censored: Transactions censored at block N-1
+    L-2 Censored: Transactions censored at block N-2
 
 Censorship Detection:
   Transactions are flagged as censored when they meet the following criteria:
   1. FOCIL-valid (max_fee >= base_fee)
-  2. Competitive priority fee (>= 25th percentile of mempool transactions)
+  2. Competitive effective priority fee (>= 25th percentile of mempool)
   3. Sufficient dwell time (>= 12 seconds in mempool)
   4. Not replaced by user via nonce replacement
-  5. Remain in mempool (not included in block)
-
-Nonce Replacement Handling:
-  To avoid false positives, transactions replaced by users are excluded from
-  censorship detection. Replacements are identified by grouping transactions
-  by (sender, nonce) and treating the highest-fee transaction as final.
+  5. Not included in current, previous, or subsequent blocks
 
 Implementation:
   - EIP-7805 compliant (8 KiB size cap per inclusion list)
-  - Transactions sorted by priority fee (descending)
+  - Transactions sorted by effective priority fee (descending)
+  - Effective priority fee = min(priority_fee, max_fee - base_fee) per EIP-1559
   - Results saved in Parquet format for analysis
+
+Inclusion Rate (Redundancy) Semantics:
+  Measures what % of IL transactions were naturally included without FOCIL.
+  Since this runs against historical data with no ILs active, we check all
+  blocks between IL construction and enforcement:
+    0-delay: checks N+1 only (built at N, enforced at N+1)
+    1-delay: checks N, N+1 (built at N-1, enforced at N+1)
+    2-delay: checks N-1, N, N+1 (built at N-2, enforced at N+1)
+  Higher redundancy for delayed variants is expected — transactions have
+  more time to be naturally included before enforcement.
 
 Reference:
   https://hackmd.io/@pellekrab/HkzMiXkmZe
 """
 
-import pandas as pd
+import io
+import logging
+import os
+import re
+import time
+
 import numpy as np
-from pathlib import Path
-from datetime import datetime
-import yaml
+import pandas as pd
 import requests
+import yaml
+from pathlib import Path
 from tqdm import tqdm
 
+log = logging.getLogger(__name__)
 
 # EIP-7805 Constants
 MAX_IL_BYTES = 8192  # 8 KiB
 
+VARIANT_NAMES = [
+    '0delay_topfee', '0delay_censored',
+    '1delay_topfee', '1delay_censored',
+    '2delay_topfee', '2delay_censored',
+]
+
 
 def load_config():
-    """Load ClickHouse config"""
-    config_file = Path(__file__).parent.parent / "config" / "config.yaml"
-    with open(config_file, 'r') as f:
-        return yaml.safe_load(f)
+    """Load config with environment variable resolution.
 
-
-def execute_query(query: str, config: dict) -> pd.DataFrame:
-    """Execute ClickHouse query via HTTP"""
-    response = requests.post(
-        config['clickhouse']['url'],
-        auth=(config['clickhouse']['user'], config['clickhouse']['password']),
-        data=(query + " FORMAT CSVWithNames").encode('utf-8'),
-        params={'database': config['clickhouse']['database']},
-        timeout=300
-    )
-
-    if response.status_code != 200:
-        raise Exception(f"HTTP {response.status_code}: {response.text}")
-
-    import io
-    return pd.read_csv(io.StringIO(response.text))
-
-
-def construct_il(mempool_txs: pd.DataFrame, base_fee: int, max_bytes: int = MAX_IL_BYTES) -> pd.DataFrame:
+    Config values like ${VAR_NAME} or ${VAR_NAME:default} are resolved
+    from environment variables. Falls back to .env file in project root.
     """
-    Construct inclusion list following EIP-7805:
-    - Filter by base fee
-    - Sort by priority fee (descending)
-    - Select top transactions until size cap
-    """
-    # Filter: only txs with max_fee >= base_fee
-    valid_txs = mempool_txs[mempool_txs['max_fee'] >= base_fee].copy()
+    project_root = Path(__file__).parent.parent
+    env_file = project_root / ".env"
 
-    if len(valid_txs) == 0:
-        return pd.DataFrame()
+    if env_file.exists():
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, _, value = line.partition('=')
+                    os.environ.setdefault(key.strip(), value.strip())
 
-    # Sort by priority fee (highest first)
-    valid_txs = valid_txs.sort_values('priority_fee', ascending=False)
+    config_file = project_root / "config" / "config.yaml"
+    with open(config_file) as f:
+        raw = f.read()
 
-    # Select transactions until we hit size cap
-    il_txs = []
-    total_size = 0
+    def _resolve(match):
+        expr = match.group(1)
+        if ':' in expr:
+            var_name, _, default = expr.partition(':')
+            return os.environ.get(var_name, default)
+        return os.environ[expr]
 
-    for idx, tx in valid_txs.iterrows():
-        # Skip transactions with missing or invalid size data
-        if pd.isna(tx['tx_size']) or tx['tx_size'] <= 0:
-            continue
-
-        tx_size = int(tx['tx_size'])
-        if total_size + tx_size <= max_bytes:
-            il_txs.append(tx)
-            total_size += tx_size
-        else:
-            break  # Hit size cap
-
-    if len(il_txs) == 0:
-        return pd.DataFrame()
-
-    return pd.DataFrame(il_txs)
+    resolved = re.sub(r'\$\{([^}]+)\}', _resolve, raw)
+    return yaml.safe_load(resolved)
 
 
-def detect_nonce_replacements(mempool_df: pd.DataFrame) -> set:
-    """
-    Identify transactions that were replaced by the user.
-    Returns set of tx_hashes that should NOT be flagged as censored.
+def execute_query(query: str, config: dict, max_retries: int = 3) -> pd.DataFrame:
+    """Execute ClickHouse query via HTTP with retry logic."""
+    ch = config['clickhouse']
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                ch['url'],
+                auth=(ch['user'], ch['password']),
+                data=(query + " FORMAT CSVWithNames").encode('utf-8'),
+                params={'database': ch['database']},
+                timeout=300,
+            )
+            if response.status_code != 200:
+                raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
+            return pd.read_csv(io.StringIO(response.text))
+        except (requests.RequestException, RuntimeError) as exc:
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                log.warning("Query failed (attempt %d/%d), retrying in %ds: %s",
+                            attempt + 1, max_retries, wait, exc)
+                time.sleep(wait)
+            else:
+                raise
 
-    Based on nonce_replacements.sql logic:
-    - Partition by (sender, nonce)
-    - Rank by fee (highest first), then timestamp (latest first)
-    - If multiple versions exist, non-final versions are "replaced"
+
+def detect_nonce_replacements(mempool_df: pd.DataFrame, included_txs_map: dict) -> set:
+    """Detect replaced transactions using actual inclusion data.
+
+    For each (sender, nonce) pair with multiple transactions:
+    - If one was included in a block, mark all others as replaced.
+    - If none were included, keep highest-fee tx, mark rest as replaced.
+
+    Returns set of replaced tx_hashes (exclude from censorship detection).
     """
     if 'sender' not in mempool_df.columns or 'nonce' not in mempool_df.columns:
         return set()
 
-    # Group by (sender, nonce) and filter for groups with multiple transactions
-    grouped = mempool_df.groupby(['sender', 'nonce'])
+    all_included = set()
+    for block_txs in included_txs_map.values():
+        all_included |= block_txs
 
-    replaced_hashes = []
-    for (sender, nonce), group in grouped:
-        if len(group) > 1:
-            # Sort by max_fee (descending) and seen_timestamp (descending)
-            sorted_group = group.sort_values(['max_fee', 'seen_timestamp'], ascending=[False, False])
-            # All transactions except the first (highest fee, latest) are replaced
-            replaced_hashes.extend(sorted_group.iloc[1:]['tx_hash'].tolist())
+    replaced = set()
+    for (_sender, _nonce), group in mempool_df.groupby(['sender', 'nonce']):
+        if len(group) <= 1:
+            continue
 
-    return set(replaced_hashes)
+        hashes = set(group['tx_hash'])
+        included_in_group = hashes & all_included
+
+        if included_in_group:
+            final_tx = next(iter(included_in_group))
+            replaced.update(hashes - {final_tx})
+        else:
+            best = group.sort_values('max_fee', ascending=False).iloc[0]['tx_hash']
+            replaced.update(hashes - {best})
+
+    return replaced
+
+
+def get_block_transactions_batch(start_block: int, end_block: int, config: dict) -> dict:
+    """Fetch included transactions for a range of blocks.
+
+    Returns dict mapping block_number -> set(tx_hashes).
+    """
+    log.info("Fetching included transactions for blocks %d to %d", start_block, end_block)
+
+    query = f"""
+    SELECT DISTINCT
+        block_number,
+        transaction_hash
+    FROM canonical_execution_transaction
+    WHERE block_number >= {start_block}
+      AND block_number < {end_block}
+    """
+    df = execute_query(query, config)
+
+    if len(df) == 0:
+        log.warning("No included transactions found for range %d-%d", start_block, end_block)
+        return {}
+
+    result = {}
+    for block_num, group in df.groupby('block_number'):
+        result[int(block_num)] = set(group['transaction_hash'])
+
+    log.info("Got %d blocks with %d included txs", len(result), len(df))
+    return result
+
+
+def pack_il(candidates: pd.DataFrame, max_bytes: int = MAX_IL_BYTES) -> pd.DataFrame:
+    """Pack sorted candidates into an inclusion list respecting the size cap.
+
+    Uses vectorized cumsum instead of row-by-row iteration.
+    Candidates must already be sorted by priority (descending).
+    """
+    if len(candidates) == 0:
+        return pd.DataFrame()
+
+    valid = candidates[candidates['tx_size'].notna() & (candidates['tx_size'] > 0)].copy()
+    if len(valid) == 0:
+        return pd.DataFrame()
+
+    valid['_cumsize'] = valid['tx_size'].astype(int).cumsum()
+    packed = valid[valid['_cumsize'] <= max_bytes].drop(columns=['_cumsize'])
+
+    return packed if len(packed) > 0 else pd.DataFrame()
+
+
+def construct_il_variant(
+    mempool_df: pd.DataFrame,
+    variant_type: str,
+    delay: int,
+    block_num: int,
+    block_ts: int,
+    base_fee: int,
+    blocks_df: pd.DataFrame,
+    censored_txs: pd.DataFrame,
+    exclusion_tracker: dict,
+    config: dict,
+    max_bytes: int = MAX_IL_BYTES,
+) -> pd.DataFrame:
+    """Unified IL construction for all 6 variants.
+
+    For topfee: selects highest effective-priority-fee txs from the mempool
+    window of block (N - delay). Filters to EIP-1559 (type 2) only.
+
+    For censored: uses pre-flagged censored transactions, revalidated against
+    the current block's base fee.
+    """
+    variant_name = f"{delay}delay_{variant_type}"
+    window_start = config['analysis']['time_window_start_secs']
+    window_end = config['analysis']['time_window_end_secs']
+
+    # Step 1: Get candidate transactions
+    if variant_type == 'topfee':
+        if delay == 0:
+            target_ts = block_ts
+        else:
+            target_block = blocks_df[blocks_df['block_number'] == block_num - delay]
+            if len(target_block) == 0:
+                return pd.DataFrame()
+            target_ts = int(target_block.iloc[0]['block_timestamp'])
+
+        candidates = mempool_df[
+            (mempool_df['seen_timestamp'] >= target_ts + window_start) &
+            (mempool_df['seen_timestamp'] <= target_ts + window_end) &
+            (mempool_df['max_fee'] >= base_fee)
+        ].copy()
+
+        # Filter to EIP-1559 (type 2) only to exclude phantom/spam legacy txs
+        if 'tx_type' in candidates.columns:
+            candidates = candidates[candidates['tx_type'] == 2]
+
+    elif variant_type == 'censored':
+        if censored_txs is None or len(censored_txs) == 0:
+            return pd.DataFrame()
+        candidates = censored_txs[censored_txs['max_fee'] >= base_fee].copy()
+
+    else:
+        raise ValueError(f"Unknown variant_type: {variant_type}")
+
+    if len(candidates) == 0:
+        return pd.DataFrame()
+
+    # Step 2: Deduplicate and compute effective priority fee
+    candidates['effective_priority_fee'] = np.minimum(
+        candidates['priority_fee'].astype(int),
+        candidates['max_fee'].astype(int) - base_fee,
+    )
+    candidates = candidates.sort_values('effective_priority_fee', ascending=False)
+    candidates = candidates.drop_duplicates(subset='tx_hash', keep='first')
+
+    # Step 3: Exclude txs already included via previous ILs
+    excluded = exclusion_tracker.get(variant_name, set())
+    if excluded:
+        candidates = candidates[~candidates['tx_hash'].isin(excluded)]
+
+    if len(candidates) == 0:
+        return pd.DataFrame()
+
+    # Step 4: Pack into IL
+    return pack_il(candidates, max_bytes)
 
 
 def flag_censored_transactions(
     mempool_df: pd.DataFrame,
-    block_timestamp: int,
-    base_fee: int,
+    current_block_ts: int,
+    current_base_fee: int,
+    prev_block_gas_used: int,
+    prev_block_gas_limit: int,
+    curr_block_gas_used: int,
+    curr_block_gas_limit: int,
     replaced_txs: set,
-    config: dict
+    all_included_txs: set,
+    active_senders: set,
+    config: dict,
 ) -> pd.DataFrame:
-    """
-    Flag transactions as censored based on configured thresholds.
-    All parameters read from config.
+    """Flag transactions as censored using dual capacity check.
+
+    A transaction is censored if:
+    1. FOCIL-valid (max_fee >= base_fee)
+    2. Competitive effective priority fee (>= configured percentile)
+    3. Dwell time within [min, max] window
+    4. Not a nonce replacement
+    5. Would have fit in both previous and current block (gas capacity)
+    6. Not included in any block from prev through subsequent
+    7. From an active sender (has at least one included tx in nearby blocks)
+
+    The active sender filter (7) removes phantom/spam transactions that meet
+    fee thresholds but are never actually mined. ~70% of FOCIL-valid mempool
+    txs with sufficient dwell time are never included in any of 15 surrounding
+    blocks. Requiring the sender to have real on-chain activity filters these
+    out without using forward-looking data (sender activity is observable from
+    the blocks already produced before the IL is constructed).
     """
     if len(mempool_df) == 0:
         return pd.DataFrame()
 
-    # Load censorship detection parameters from config
-    min_dwell_time_secs = config['analysis']['censorship_dwell_time_secs']
-    fee_percentile = config['analysis']['censorship_fee_percentile']
-    percentile_window_secs = config['analysis']['censorship_percentile_window_secs']
+    min_dwell = config['analysis']['censorship_dwell_time_secs']
+    max_dwell = config['analysis'].get('censorship_max_dwell_time_secs', 120)
+    fee_pct = config['analysis']['censorship_fee_percentile']
+    pct_window = config['analysis']['censorship_percentile_window_secs']
 
-    # Calculate fee percentile from mempool txs seen before block
-    pre_block_txs = mempool_df[
-        (mempool_df['seen_timestamp'] >= block_timestamp - percentile_window_secs) &
-        (mempool_df['seen_timestamp'] <= block_timestamp)
+    # Fee threshold from FOCIL-valid mempool txs seen before the block.
+    # Only include txs with max_fee >= base_fee so the effective priority
+    # fee is non-negative — otherwise underpriced txs drag the percentile
+    # to meaningless negative values.
+    pre_block = mempool_df[
+        (mempool_df['seen_timestamp'] >= current_block_ts - pct_window) &
+        (mempool_df['seen_timestamp'] <= current_block_ts) &
+        (mempool_df['max_fee'] >= current_base_fee)
     ]
-
-    if len(pre_block_txs) == 0:
+    if len(pre_block) == 0:
         return pd.DataFrame()
 
-    fee_threshold = pre_block_txs['priority_fee'].quantile(fee_percentile)
+    effective_fees = np.minimum(
+        pre_block['priority_fee'].astype(int),
+        pre_block['max_fee'].astype(int) - current_base_fee,
+    )
+    fee_threshold = effective_fees.quantile(fee_pct)
 
-    # Step 2: For each transaction, calculate dwell time
-    # First seen = min(seen_timestamp) for that tx_hash
-    # Last seen = max(seen_timestamp) for that tx_hash
-    tx_lifecycle = mempool_df.groupby('tx_hash').agg({
-        'seen_timestamp': ['min', 'max'],
+    # Aggregate per-tx lifecycle
+    lifecycle = mempool_df.groupby('tx_hash').agg({
+        'seen_timestamp': 'min',
         'max_fee': 'first',
         'priority_fee': 'first',
-        'tx_size': 'first'
+        'tx_size': 'first',
+        'gas_limit': 'first',
+        'sender': 'first',
     }).reset_index()
-    tx_lifecycle.columns = ['tx_hash', 'first_seen', 'last_seen', 'max_fee',
-                             'priority_fee', 'tx_size']
+    lifecycle.rename(columns={'seen_timestamp': 'first_seen'}, inplace=True)
 
-    # Filter for censored candidates
-    censored = tx_lifecycle[
-        # FOCIL-valid
-        (tx_lifecycle['max_fee'] >= base_fee) &
-        # Competitive priority fee
-        (tx_lifecycle['priority_fee'] >= fee_threshold) &
-        # First seen before block
-        (tx_lifecycle['first_seen'] < block_timestamp) &
-        # Sufficient dwell time
-        ((block_timestamp - tx_lifecycle['first_seen']) >= min_dwell_time_secs) &
-        # NOT replaced by user
-        (~tx_lifecycle['tx_hash'].isin(replaced_txs)) &
-        # Still in mempool (not included yet)
-        (tx_lifecycle['last_seen'] >= block_timestamp - min_dwell_time_secs)
+    # Compute effective priority fee per tx
+    lifecycle['effective_priority_fee'] = np.minimum(
+        lifecycle['priority_fee'].astype(int),
+        lifecycle['max_fee'].astype(int) - current_base_fee,
+    )
+
+    dwell = current_block_ts - lifecycle['first_seen']
+    gas = pd.to_numeric(lifecycle['gas_limit'], errors='coerce')
+    prev_available = prev_block_gas_limit - prev_block_gas_used
+    curr_available = curr_block_gas_limit - curr_block_gas_used
+
+    candidates = lifecycle[
+        (lifecycle['max_fee'] >= current_base_fee) &
+        (lifecycle['effective_priority_fee'] >= fee_threshold) &
+        (lifecycle['first_seen'] < current_block_ts) &
+        (dwell >= min_dwell) &
+        (dwell <= max_dwell) &
+        (~lifecycle['tx_hash'].isin(replaced_txs)) &
+        (gas <= prev_available) &
+        (gas <= curr_available) &
+        (~lifecycle['tx_hash'].isin(all_included_txs)) &
+        (lifecycle['sender'].isin(active_senders))
     ]
 
-    return censored
+    return candidates
 
 
-def construct_censored_il(
-    censored_txs: pd.DataFrame,
-    max_bytes: int = MAX_IL_BYTES
-) -> pd.DataFrame:
+def _get_block_int(block_row, col):
+    """Safely extract integer value from a block row, defaulting to 0."""
+    val = block_row[col]
+    return int(val) if pd.notna(val) else 0
+
+
+def process_single_block(
+    block_row,
+    blocks_df: pd.DataFrame,
+    mempool_df: pd.DataFrame,
+    included_txs_map: dict,
+    replaced_txs: set,
+    exclusion_tracker: dict,
+    config: dict,
+    collect_metrics: bool = False,
+) -> dict | None:
+    """Process a single block: build all 6 IL variants, update exclusion tracker.
+
+    When collect_metrics=True, returns a dict of per-block metrics.
+    When False (warm-up), returns None.
     """
-    Construct IL containing ONLY censored transactions.
-    Sort by priority fee (highest first) to prioritize most valuable censored txs.
-    Pack until 8 KiB size cap.
-    """
-    if len(censored_txs) == 0:
-        return pd.DataFrame()
+    block_num = int(block_row['block_number'])
+    block_ts = int(block_row['block_timestamp'])
+    base_fee = int(block_row['base_fee'])
+    gas_used = _get_block_int(block_row, 'gas_used')
+    gas_limit = _get_block_int(block_row, 'gas_limit')
 
-    # Sort censored transactions by priority fee (highest first)
-    sorted_txs = censored_txs.sort_values('priority_fee', ascending=False)
+    window_start = config['analysis']['time_window_start_secs']
+    window_end = config['analysis']['time_window_end_secs']
 
-    # Pack until size cap
-    il_txs = []
-    total_size = 0
+    result = None
+    if collect_metrics:
+        result = {
+            'block_number': block_num,
+            'block_timestamp': block_ts,
+            'base_fee': base_fee,
+            'gas_used': gas_used,
+            'gas_limit': gas_limit,
+            'included_tx_count': int(block_row['included_tx_count']),
+        }
 
-    for idx, tx in sorted_txs.iterrows():
-        # Skip transactions with missing or invalid size data
-        if pd.isna(tx['tx_size']) or tx['tx_size'] <= 0:
-            continue
+        # Mempool coverage of next block
+        next_block_txs = included_txs_map.get(block_num + 1, set())
+        window_hashes = set(mempool_df[
+            (mempool_df['seen_timestamp'] >= block_ts + window_start) &
+            (mempool_df['seen_timestamp'] <= block_ts + window_end)
+        ]['tx_hash'].unique())
+        overlap = window_hashes & next_block_txs
+        result['mempool_coverage_of_next_block'] = (
+            len(overlap) / len(next_block_txs) * 100
+            if next_block_txs else 0.0
+        )
+        result['mempool_unique_txs_in_window'] = len(window_hashes)
 
-        tx_size = int(tx['tx_size'])
-        if total_size + tx_size <= max_bytes:
-            il_txs.append(tx)
-            total_size += tx_size
-        else:
-            break  # Hit size cap
+    # Compute active senders: mempool senders with at least one tx included
+    # in blocks before the current one. This filters phantom/spam senders
+    # without using forward-looking data.
+    all_included_before = set()
+    for bn in range(block_num - 10, block_num):
+        all_included_before |= included_txs_map.get(bn, set())
+    mempool_senders_with_inclusion = mempool_df[
+        mempool_df['tx_hash'].isin(all_included_before)
+    ]['sender'].unique()
+    active_senders = set(mempool_senders_with_inclusion)
 
-    if len(il_txs) == 0:
-        return pd.DataFrame()
+    # Build all 6 variants
+    for delay in [0, 1, 2]:
+        for variant_type in ['topfee', 'censored']:
+            variant_name = f'{delay}delay_{variant_type}'
 
-    return pd.DataFrame(il_txs)
+            # For censored variants, flag censored transactions first
+            censored_txs = None
+            if variant_type == 'censored':
+                target_block_num = block_num - delay
+                prev_blk = blocks_df[blocks_df['block_number'] == target_block_num - 1]
+                curr_blk = blocks_df[blocks_df['block_number'] == target_block_num]
+
+                if len(prev_blk) > 0 and len(curr_blk) > 0:
+                    target = curr_blk.iloc[0]
+
+                    # Gather all included txs from prev through current block
+                    all_included = set()
+                    for bn in range(target_block_num - 1, block_num + 1):
+                        all_included |= included_txs_map.get(bn, set())
+
+                    censored_txs = flag_censored_transactions(
+                        mempool_df=mempool_df,
+                        current_block_ts=int(target['block_timestamp']),
+                        current_base_fee=int(target['base_fee']),
+                        prev_block_gas_used=_get_block_int(prev_blk.iloc[0], 'gas_used'),
+                        prev_block_gas_limit=_get_block_int(prev_blk.iloc[0], 'gas_limit'),
+                        curr_block_gas_used=_get_block_int(target, 'gas_used'),
+                        curr_block_gas_limit=_get_block_int(target, 'gas_limit'),
+                        replaced_txs=replaced_txs,
+                        all_included_txs=all_included,
+                        active_senders=active_senders,
+                        config=config,
+                    )
+
+                    if collect_metrics and delay == 1:
+                        result['censored_detected_count'] = len(censored_txs) if censored_txs is not None else 0
+
+            # Construct IL
+            il_df = construct_il_variant(
+                mempool_df=mempool_df,
+                variant_type=variant_type,
+                delay=delay,
+                block_num=block_num,
+                block_ts=block_ts,
+                base_fee=base_fee,
+                blocks_df=blocks_df,
+                censored_txs=censored_txs,
+                exclusion_tracker=exclusion_tracker,
+                config=config,
+            )
+
+            if collect_metrics:
+                result[f'{variant_name}_tx_count'] = len(il_df)
+                result[f'{variant_name}_size_bytes'] = (
+                    int(il_df['tx_size'].sum()) if len(il_df) > 0 else 0
+                )
+
+                # Inclusion rate (redundancy): what % of IL txs were included
+                # in any block between IL construction and enforcement?
+                # A delayed IL is built from block (N-delay)'s mempool window.
+                # Between construction and enforcement at N+1, transactions may
+                # be naturally included in blocks N-delay+1 through N+1.
+                # Checking this full range measures how redundant the IL is
+                # against historical block production (no ILs were active).
+                if len(il_df) > 0:
+                    included_in_range = set()
+                    for bn in range(block_num - delay + 1, block_num + 2):
+                        included_in_range |= included_txs_map.get(bn, set())
+                    if included_in_range:
+                        il_hashes = set(il_df['tx_hash'])
+                        rate = len(il_hashes & included_in_range) / len(il_hashes) * 100
+                        result[f'{variant_name}_inclusion_rate'] = rate
+                    else:
+                        result[f'{variant_name}_inclusion_rate'] = None
+                else:
+                    result[f'{variant_name}_inclusion_rate'] = None
+
+            # Update exclusion tracker: check all blocks from construction
+            # through enforcement (N-delay+1 to N+1) for actual inclusion
+            if len(il_df) > 0:
+                included_in_range = set()
+                for bn in range(block_num - delay + 1, block_num + 2):
+                    included_in_range |= included_txs_map.get(bn, set())
+                il_hashes = set(il_df['tx_hash'])
+                actually_included = il_hashes & included_in_range
+                exclusion_tracker[variant_name].update(actually_included)
+
+                if collect_metrics:
+                    result[f'{variant_name}_actually_included'] = len(actually_included)
+            elif collect_metrics:
+                result[f'{variant_name}_actually_included'] = 0
+
+    return result
 
 
 def analyze_block_range(start_block: int, end_block: int, config: dict):
-    """Analyze a range of blocks with proper L₀, L₋₁, L₋₂ construction"""
+    """6-variant FOCIL analysis with verified deduplication.
 
-    print(f"\nAnalyzing blocks {start_block:,} to {end_block:,}")
+    Processes blocks sequentially with a 3-block warm-up phase to populate
+    the exclusion tracker before collecting metrics.
+    """
+    log.info("Analyzing blocks %d to %d", start_block, end_block)
 
-    # Fetch block data
-    print("  Fetching block data...")
+    # Fetch blocks (extra padding for warm-up and forward lookback)
+    log.info("Fetching block data...")
     blocks_query = f"""
     SELECT
         execution_payload_block_number as block_number,
         toUnixTimestamp(slot_start_date_time) as block_timestamp,
         toUInt256(execution_payload_base_fee_per_gas) as base_fee,
-        execution_payload_transactions_count as included_tx_count
+        execution_payload_transactions_count as included_tx_count,
+        toUInt256(execution_payload_gas_used) as gas_used,
+        toUInt256(execution_payload_gas_limit) as gas_limit
     FROM canonical_beacon_block
-    WHERE execution_payload_block_number >= {start_block}
-      AND execution_payload_block_number < {end_block}
+    WHERE execution_payload_block_number >= {start_block - 3}
+      AND execution_payload_block_number < {end_block + 3}
     ORDER BY execution_payload_block_number
     """
     blocks_df = execute_query(blocks_query, config)
-
     if len(blocks_df) == 0:
-        print("  No blocks found!")
+        log.warning("No blocks found for range %d-%d", start_block, end_block)
         return None
 
-    # Calculate overall time range for mempool query
+    blocks_df['gas_used'] = pd.to_numeric(blocks_df['gas_used'], errors='coerce')
+    blocks_df['gas_limit'] = pd.to_numeric(blocks_df['gas_limit'], errors='coerce')
+    log.info("Got %d blocks (including warm-up and lookback)", len(blocks_df))
+
+    # Mempool time range
     window_start = config['analysis']['time_window_start_secs']
     window_end = config['analysis']['time_window_end_secs']
+    min_ts = blocks_df['block_timestamp'].min() - 24 + window_start - 2
+    max_ts = blocks_df['block_timestamp'].max() + window_end + 2
 
-    # Need to go back 2 blocks for L₋₂
-    min_timestamp = blocks_df['block_timestamp'].min() - 24 + window_start - 2
-    max_timestamp = blocks_df['block_timestamp'].max() + window_end + 2
-
-    # Fetch mempool data for entire time range
-    print(f"  Fetching mempool data from {min_timestamp} to {max_timestamp}...")
+    log.info("Fetching mempool data...")
     mempool_query = f"""
     SELECT
         hash as tx_hash,
@@ -275,224 +587,189 @@ def analyze_block_range(start_block: int, end_block: int, config: dict):
         toUnixTimestamp(event_date_time) as seen_timestamp,
         toUInt256(gas_fee_cap) as max_fee,
         toUInt256(gas_tip_cap) as priority_fee,
-        size as tx_size
+        size as tx_size,
+        toUInt256(gas) as gas_limit,
+        type as tx_type
     FROM mempool_transaction
-    WHERE event_date_time >= toDateTime({int(min_timestamp)})
-      AND event_date_time < toDateTime({int(max_timestamp)})
+    WHERE event_date_time >= toDateTime({int(min_ts)})
+      AND event_date_time < toDateTime({int(max_ts)})
     ORDER BY event_date_time
     """
     mempool_df = execute_query(mempool_query, config)
+    mempool_df['gas_limit'] = pd.to_numeric(mempool_df['gas_limit'], errors='coerce')
+    log.info("Got %d mempool transactions", len(mempool_df))
 
-    print(f"  Got {len(blocks_df)} blocks and {len(mempool_df):,} mempool txs")
+    # Included transactions
+    log.info("Fetching included transactions...")
+    try:
+        included_txs_map = get_block_transactions_batch(start_block - 3, end_block + 3, config)
+    except Exception as exc:
+        log.warning("Could not fetch inclusion data: %s", exc)
+        included_txs_map = {}
 
-    # Detect nonce replacements to avoid false censorship flags
-    replaced_txs_set = detect_nonce_replacements(mempool_df)
-    print(f"  Found {len(replaced_txs_set):,} replaced transactions (will not flag as censored)")
+    # Nonce replacements
+    log.info("Detecting nonce replacements...")
+    replaced_txs = detect_nonce_replacements(mempool_df, included_txs_map)
+    log.info("Found %d replaced transactions", len(replaced_txs))
 
-    # Process each block
-    print("  Constructing ILs...")
-    results = []
+    # Initialize exclusion tracker
+    exclusion_tracker = {name: set() for name in VARIANT_NAMES}
 
-    for idx, block in tqdm(blocks_df.iterrows(), total=len(blocks_df), desc="  Processing"):
-        block_num = block['block_number']
-        block_ts = block['block_timestamp']
-        base_fee = int(block['base_fee'])
-
-        # ===== L₀: IL based on current block (N) timestamp =====
-        L0_window_mask = (
-            (mempool_df['seen_timestamp'] >= block_ts + window_start) &
-            (mempool_df['seen_timestamp'] <= block_ts + window_end)
+    # Warm-up phase (3 blocks before start)
+    log.info("Warm-up phase (3 blocks)...")
+    warmup = blocks_df[
+        (blocks_df['block_number'] >= start_block - 3) &
+        (blocks_df['block_number'] < start_block)
+    ]
+    for _, block_row in warmup.iterrows():
+        process_single_block(
+            block_row, blocks_df, mempool_df, included_txs_map,
+            replaced_txs, exclusion_tracker, config,
+            collect_metrics=False,
         )
-        L0_mempool = mempool_df[L0_window_mask].copy()
-        L0_il = construct_il(L0_mempool, base_fee)
 
-        # ===== L₋₁: IL containing ONLY censored transactions from N-1 =====
-        prev_block = blocks_df[blocks_df['block_number'] == block_num - 1]
-        L1_censored = pd.DataFrame()  # Initialize
-        if len(prev_block) > 0:
-            prev_ts = prev_block.iloc[0]['block_timestamp']
-            prev_base_fee = int(prev_block.iloc[0]['base_fee'])
+    # Main processing
+    log.info("Main processing phase...")
+    main_blocks = blocks_df[
+        (blocks_df['block_number'] >= start_block) &
+        (blocks_df['block_number'] < end_block)
+    ]
 
-            # Flag censored transactions at block N-1
-            L1_censored = flag_censored_transactions(
-                mempool_df=mempool_df,
-                block_timestamp=prev_ts,
-                base_fee=prev_base_fee,
-                replaced_txs=replaced_txs_set,
-                config=config
-            )
+    results = []
+    for _, block_row in tqdm(main_blocks.iterrows(), total=len(main_blocks), desc="  Processing"):
+        row = process_single_block(
+            block_row, blocks_df, mempool_df, included_txs_map,
+            replaced_txs, exclusion_tracker, config,
+            collect_metrics=True,
+        )
+        if row:
+            results.append(row)
 
-            # Construct L₋₁ with ONLY censored transactions
-            L1_il = construct_censored_il(L1_censored, max_bytes=MAX_IL_BYTES)
-        else:
-            L1_il = pd.DataFrame()
+    return pd.DataFrame(results) if results else None
 
-        # ===== L₋₂: IL containing ONLY censored transactions from N-2 =====
-        prev2_block = blocks_df[blocks_df['block_number'] == block_num - 2]
-        L2_censored = pd.DataFrame()  # Initialize
-        if len(prev2_block) > 0:
-            prev2_ts = prev2_block.iloc[0]['block_timestamp']
-            prev2_base_fee = int(prev2_block.iloc[0]['base_fee'])
 
-            # Flag censored transactions at block N-2
-            L2_censored = flag_censored_transactions(
-                mempool_df=mempool_df,
-                block_timestamp=prev2_ts,
-                base_fee=prev2_base_fee,
-                replaced_txs=replaced_txs_set,
-                config=config
-            )
+def print_summary(df: pd.DataFrame):
+    """Print analysis summary to stdout."""
+    blocks_per_year = 7200 * 365
 
-            # Construct L₋₂ with ONLY censored transactions
-            L2_il = construct_censored_il(L2_censored, max_bytes=MAX_IL_BYTES)
-        else:
-            L2_il = pd.DataFrame()
+    print("\n" + "=" * 70)
+    print("SUMMARY - 6-VARIANT FOCIL ANALYSIS")
+    print("=" * 70)
 
-        # Calculate sizes
-        L0_size = L0_il['tx_size'].sum() if len(L0_il) > 0 else 0
-        L1_size = L1_il['tx_size'].sum() if len(L1_il) > 0 else 0
-        L2_size = L2_il['tx_size'].sum() if len(L2_il) > 0 else 0
+    print(f"\nBlocks analyzed: {len(df):,}")
+    avg_gas_pct = df['gas_used'].mean() / df['gas_limit'].mean() * 100
+    print(f"Average gas usage: {df['gas_used'].mean() / 1e6:.2f}M ({avg_gas_pct:.1f}% of limit)")
 
-        # Calculate overlaps (transaction hashes in both lists)
-        L0_hashes = set(L0_il['tx_hash']) if len(L0_il) > 0 else set()
-        L1_hashes = set(L1_il['tx_hash']) if len(L1_il) > 0 else set()
-        L2_hashes = set(L2_il['tx_hash']) if len(L2_il) > 0 else set()
+    if 'mempool_coverage_of_next_block' in df.columns:
+        print(f"Avg mempool coverage of next block: {df['mempool_coverage_of_next_block'].mean():.1f}%")
+        print(f"Avg unique mempool txs in window: {df['mempool_unique_txs_in_window'].mean():.0f}")
 
-        L0_L1_intersection = L0_hashes & L1_hashes
-        L0_L2_intersection = L0_hashes & L2_hashes
+    # Bandwidth matrix
+    print("\n" + "=" * 70)
+    print("BANDWIDTH MATRIX")
+    print("=" * 70)
 
-        # Calculate overlap sizes
-        if len(L0_il) > 0 and len(L0_L1_intersection) > 0:
-            L0_L1_overlap_size = L0_il[L0_il['tx_hash'].isin(L0_L1_intersection)]['tx_size'].sum()
-        else:
-            L0_L1_overlap_size = 0
+    for strategy in ['topfee', 'censored']:
+        label = "Top Fee" if strategy == 'topfee' else "Censored"
+        print(f"\n## {label} Strategy")
+        for delay in [0, 1, 2]:
+            col_size = f'{delay}delay_{strategy}_size_bytes'
+            col_count = f'{delay}delay_{strategy}_tx_count'
+            col_rate = f'{delay}delay_{strategy}_inclusion_rate'
 
-        if len(L0_il) > 0 and len(L0_L2_intersection) > 0:
-            L0_L2_overlap_size = L0_il[L0_il['tx_hash'].isin(L0_L2_intersection)]['tx_size'].sum()
-        else:
-            L0_L2_overlap_size = 0
+            avg_kb = df[col_size].mean() / 1024
+            avg_count = df[col_count].mean()
+            annual_gb = df[col_size].mean() * blocks_per_year / (1024 ** 3)
 
-        # Bandwidth calculations
-        # With 1-slot delay: validators already have L₋₁, so we only send L₀ \ L₋₁
-        L1_effective_size = L0_size - L0_L1_overlap_size
-        L1_bandwidth_saved = L0_L1_overlap_size
+            line = f"  {delay}-delay: {avg_kb:.2f} KiB/block, {avg_count:.1f} txs, {annual_gb:.2f} GB/year"
+            if col_rate in df.columns and df[col_rate].notna().any():
+                line += f", inclusion={df[col_rate].dropna().mean():.1f}%"
+            print(line)
 
-        # With 2-slot delay: validators already have L₋₂, so we only send L₀ \ L₋₂
-        L2_effective_size = L0_size - L0_L2_overlap_size
-        L2_bandwidth_saved = L0_L2_overlap_size
+    # Delay effect (primary research question)
+    print("\n" + "=" * 70)
+    print("DELAY EFFECT ON BANDWIDTH")
+    print("=" * 70)
 
-        results.append({
-            'block_number': block_num,
-            'block_timestamp': block_ts,
-            'base_fee': base_fee,
-            'included_tx_count': block['included_tx_count'],
+    for strategy in ['topfee', 'censored']:
+        label = "Top Fee" if strategy == 'topfee' else "Censored"
+        base = df[f'0delay_{strategy}_size_bytes'].mean()
+        if base == 0:
+            continue
+        print(f"\n## {label} Strategy")
+        for delay in [0, 1, 2]:
+            val = df[f'{delay}delay_{strategy}_size_bytes'].mean()
+            annual = val * blocks_per_year / (1024 ** 3)
+            pct = (val / base - 1) * 100 if delay > 0 else 0
+            suffix = f" ({pct:+.1f}%)" if delay > 0 else " (baseline)"
+            print(f"  {delay}-delay: {annual:.2f} GB/year{suffix}")
 
-            # L₀ metrics
-            'L0_tx_count': len(L0_il),
-            'L0_size_bytes': L0_size,
+    # Censorship summary
+    if 'censored_detected_count' in df.columns:
+        print("\n" + "=" * 70)
+        print("CENSORSHIP DETECTION")
+        print("=" * 70)
+        avg = df['censored_detected_count'].mean()
+        blocks_with = (df['censored_detected_count'] > 0).sum()
+        print(f"  Average censored txs/block: {avg:.2f}")
+        print(f"  Blocks with censorship: {blocks_with:,} ({blocks_with / len(df) * 100:.1f}%)")
 
-            # L₋₁ metrics
-            'L1_tx_count': len(L1_il),
-            'L1_size_bytes': L1_size,
-            'L1_censored_tx_count': len(L1_censored),
-            'L0_L1_intersection_count': len(L0_L1_intersection),
-            'L0_L1_intersection_bytes': L0_L1_overlap_size,
-            'L1_effective_bytes': L1_effective_size,
-            'L1_bandwidth_saved': L1_bandwidth_saved,
-            'L1_savings_pct': (L1_bandwidth_saved / L0_size * 100) if L0_size > 0 else 0,
-
-            # L₋₂ metrics
-            'L2_tx_count': len(L2_il),
-            'L2_size_bytes': L2_size,
-            'L2_censored_tx_count': len(L2_censored),
-            'L0_L2_intersection_count': len(L0_L2_intersection),
-            'L0_L2_intersection_bytes': L0_L2_overlap_size,
-            'L2_effective_bytes': L2_effective_size,
-            'L2_bandwidth_saved': L2_bandwidth_saved,
-            'L2_savings_pct': (L2_bandwidth_saved / L0_size * 100) if L0_size > 0 else 0,
-        })
-
-    return pd.DataFrame(results)
+    # Statistical notes
+    print("\n" + "=" * 70)
+    print("STATISTICAL NOTES")
+    print("=" * 70)
+    n = len(df)
+    print(f"  Sample size: {n:,} blocks")
+    if n < 1000:
+        print("  WARNING: Small sample. Recommend >= 1,000 blocks (ideally 50,000+).")
+    elif n < 10000:
+        print("  Moderate sample. Results indicative but extend to 50,000 for publication.")
+    else:
+        print("  Large sample. Results likely statistically significant.")
+    print()
 
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+        datefmt='%H:%M:%S',
+    )
+
     config = load_config()
 
-    print("="*70)
+    print("=" * 70)
     print("FOCIL CENSORSHIP ANALYSIS")
-    print("="*70)
-    print(f"Inclusion list size cap: {MAX_IL_BYTES:,} bytes ({MAX_IL_BYTES/1024:.1f} KiB)")
-    print(f"Time window: {config['analysis']['time_window_start_secs']} to {config['analysis']['time_window_end_secs']} seconds")
+    print("=" * 70)
+    print(f"IL size cap: {MAX_IL_BYTES:,} bytes ({MAX_IL_BYTES / 1024:.1f} KiB)")
+    print(f"Time window: [{config['analysis']['time_window_start_secs']}, "
+          f"{config['analysis']['time_window_end_secs']}] seconds")
 
-    # Load block range and batch size from configuration
     start_block = config['analysis']['start_block']
     end_block = config['analysis']['end_block']
     batch_size = config['analysis'].get('batch_size_blocks', 100)
 
     all_results = []
-
     for batch_start in range(start_block, end_block, batch_size):
         batch_end = min(batch_start + batch_size, end_block)
         result = analyze_block_range(batch_start, batch_end, config)
         if result is not None:
             all_results.append(result)
 
-    # Combine results
-    df = pd.concat(all_results, ignore_index=True)
+    if not all_results:
+        log.error("No results produced.")
+        return
 
-    # Remove first 2 blocks (no L₋₂ data)
-    df = df[df['block_number'] > df['block_number'].min() + 2]
+    df = pd.concat(all_results, ignore_index=True)
 
     # Save results
     results_dir = Path(__file__).parent.parent / "results"
+    results_dir.mkdir(exist_ok=True)
     output_file = results_dir / "focil_censorship_analysis.parquet"
     df.to_parquet(output_file, index=False)
     print(f"\nResults saved to: {output_file}")
 
-    # Print summary
-    print("\n" + "="*70)
-    print("SUMMARY")
-    print("="*70)
-
-    print(f"\nBlocks analyzed: {len(df):,}")
-
-    print(f"\n## L₀ (highest-fee transactions)")
-    print(f"Average size: {df['L0_size_bytes'].mean()/1024:.2f} KiB")
-    print(f"Average transaction count: {df['L0_tx_count'].mean():.1f}")
-
-    print(f"\n## L₋₁ (censored transactions from N-1)")
-    print(f"Total censored transactions detected: {df['L1_censored_tx_count'].mean():.1f}")
-    print(f"Average inclusion list size: {df['L1_size_bytes'].mean()/1024:.2f} KiB")
-    print(f"Average transactions in IL: {df['L1_tx_count'].mean():.1f}")
-    print(f"Overlap with L₀: {df['L0_L1_intersection_bytes'].mean()/1024:.2f} KiB ({df['L1_savings_pct'].mean():.1f}%)")
-    print(f"Effective bandwidth: {df['L1_effective_bytes'].mean()/1024:.2f} KiB")
-    print(f"Bandwidth saved: {df['L1_bandwidth_saved'].mean()/1024:.2f} KiB per block")
-
-    print(f"\n## L₋₂ (censored transactions from N-2)")
-    print(f"Total censored transactions detected: {df['L2_censored_tx_count'].mean():.1f}")
-    print(f"Average inclusion list size: {df['L2_size_bytes'].mean()/1024:.2f} KiB")
-    print(f"Average transactions in IL: {df['L2_tx_count'].mean():.1f}")
-    print(f"Overlap with L₀: {df['L0_L2_intersection_bytes'].mean()/1024:.2f} KiB ({df['L2_savings_pct'].mean():.1f}%)")
-    print(f"Effective bandwidth: {df['L2_effective_bytes'].mean()/1024:.2f} KiB")
-    print(f"Bandwidth saved: {df['L2_bandwidth_saved'].mean()/1024:.2f} KiB per block")
-
-    print(f"\n## Censorship Detection Summary")
-    print(f"Average censored transactions (N-1): {df['L1_censored_tx_count'].mean():.1f}")
-    print(f"Average censored transactions (N-2): {df['L2_censored_tx_count'].mean():.1f}")
-    print(f"Blocks with censorship (N-1): {(df['L1_censored_tx_count'] > 0).sum():,} ({(df['L1_censored_tx_count'] > 0).sum() / len(df) * 100:.1f}%)")
-    print(f"Blocks with censorship (N-2): {(df['L2_censored_tx_count'] > 0).sum():,} ({(df['L2_censored_tx_count'] > 0).sum() / len(df) * 100:.1f}%)")
-
-    print(f"\n## Annual Bandwidth (per validator)")
-    blocks_per_year = 7200 * 365
-    L0_annual = df['L0_size_bytes'].mean() * blocks_per_year / (1024**3)
-    L1_annual = df['L1_effective_bytes'].mean() * blocks_per_year / (1024**3)
-    L2_annual = df['L2_effective_bytes'].mean() * blocks_per_year / (1024**3)
-
-    print(f"L₀: {L0_annual:.2f} GB/year")
-    print(f"L₋₁: {L1_annual:.2f} GB/year (saves {L0_annual - L1_annual:.2f} GB)")
-    print(f"L₋₂: {L2_annual:.2f} GB/year (saves {L0_annual - L2_annual:.2f} GB)")
-
-    print("\n" + "="*70)
+    print_summary(df)
 
 
 if __name__ == "__main__":
