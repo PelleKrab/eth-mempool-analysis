@@ -435,11 +435,12 @@ def process_single_block(
         result['mempool_unique_txs_in_window'] = len(window_hashes)
 
     # Compute active senders: mempool senders with at least one tx included
-    # in blocks before the current one. This filters phantom/spam senders
+    # in any block before the current one. This filters phantom/spam senders
     # without using forward-looking data.
     all_included_before = set()
-    for bn in range(block_num - 10, block_num):
-        all_included_before |= included_txs_map.get(bn, set())
+    for bn, txs in included_txs_map.items():
+        if bn < block_num:
+            all_included_before |= txs
     mempool_senders_with_inclusion = mempool_df[
         mempool_df['tx_hash'].isin(all_included_before)
     ]['sender'].unique()

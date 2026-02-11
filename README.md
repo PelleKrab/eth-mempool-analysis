@@ -4,41 +4,44 @@ Analysis framework for studying transaction censorship patterns on Ethereum usin
 
 ## Overview
 
-This project analyzes historical Ethereum mempool data to identify and quantify transaction censorship. The analysis constructs three types of inclusion lists per block and calculates overlap metrics for bandwidth optimization studies.
+This project analyzes historical Ethereum mempool data to construct mock inclusion lists and measure how many of those transactions builders naturally include. The analysis produces 6 variants per block: 2 strategies (top fee, censored) evaluated at 3 delay levels (0, 1, 2 slots).
 
-### Inclusion List Types
+### Inclusion List Strategies
 
-- **L₀**: Top-N highest priority fee transactions from the current block time window
-- **L₋₁**: Transactions flagged as censored at block N-1 (1-slot delay)
-- **L₋₂**: Transactions flagged as censored at block N-2 (2-slot delay)
+**Top Fee Strategy** - Selects the highest effective-priority-fee EIP-1559 transactions from the mempool window. One IL is built per block, then evaluated at 3 delay levels.
+
+**Censored Strategy** - Flags transactions that meet inclusion criteria but were excluded from blocks (censorship detection). One IL is built per block, then evaluated at 3 delay levels.
+
+### Delay Levels
+
+All ILs are built from block N's perspective:
+- **0-delay**: built at N, check inclusion in block N+1
+- **1-delay**: built at N, check inclusion in blocks N+1, N+2
+- **2-delay**: built at N, check inclusion in blocks N+1, N+2, N+3
+
+Higher inclusion rates at higher delays are expected (more blocks to check).
 
 ### Key Features
 
-1. **Censorship Detection**: Identifies transactions meeting inclusion criteria but excluded from blocks
-2. **Nonce Replacement Handling**: Filters user-initiated transaction replacements to avoid false positives
-3. **Bandwidth Analysis**: Calculates overlap between inclusion lists and effective bandwidth requirements
-4. **EIP-7805 Compliance**: Enforces 8 KiB size cap and priority-based ordering
+- EIP-7805 compliant (8 KiB size cap per inclusion list)
+- Effective priority fee: `min(priority_fee, max_fee - base_fee)` per EIP-1559
+- EIP-1559 (type 2) transaction filter to exclude phantom/spam legacy txs
+- Nonce replacement detection to avoid false positive censorship flags
+- Dual capacity check (previous and current block gas headroom)
+- Results saved in Parquet format
 
 ## Architecture
 
 ```
-┌─────────────────┐
-│   ClickHouse    │  Historical mempool and block data
-│   Data Source   │
-└────────┬────────┘
-         │
-         │ Query mempool transactions
-         ▼
-┌─────────────────┐
-│  Python Script  │  focil_censorship_analysis.py
-│   (Analysis)    │
-└────────┬────────┘
-         │
-         │ Export results
-         ▼
-┌─────────────────┐
-│ Parquet Output  │  Metrics per block
-│  (Results)      │
+ClickHouse (Xatu)       Python Script                   Output
+┌─────────────────┐     ┌─────────────────────────┐     ┌──────────────┐
+│ mempool_         │────>│ focil_censorship_        │────>│ .parquet     │
+│   transaction    │     │   analysis.py            │     │ per-block    │
+│ canonical_       │────>│                          │     │ metrics      │
+│   beacon_block   │     │ 6 variants per block:    │     └──────────────┘
+│ canonical_       │────>│  3 delays x 2 strategies │
+│   execution_     │     └─────────────────────────┘
+│   transaction    │
 └─────────────────┘
 ```
 
@@ -47,21 +50,14 @@ This project analyzes historical Ethereum mempool data to identify and quantify 
 ```
 eth-mempool-analysis/
 ├── config/
-│   └── config.yaml                    Configuration parameters
-├── queries/
-│   ├── censorship_events.sql          Reference: Censorship detection patterns
-│   ├── nonce_replacements.sql         Reference: Replacement detection patterns
-│   ├── block_il_metrics.sql           Reference: Block metrics
-│   └── mempool_time_range.sql         Reference: Mempool queries
+│   └── config.yaml                    Configuration (ClickHouse creds + analysis params)
 ├── scripts/
 │   ├── focil_censorship_analysis.py   Main analysis script
-│   ├── batch_processor.py             Legacy batch processor
-│   └── analyze_results.py             Results visualization
-├── results/
-│   ├── focil_censorship_analysis.parquet  Analysis output
-│   └── archive_old_methodology/           Archived results
-├── requirements.txt                   Python dependencies
-└── README.md                          This file
+│   ├── batch_runner.py                Parallel batch processing for large ranges
+│   ├── combine_chunks.py             Combine chunk parquets into one file
+│   └── generate_chunk_ranges.py       Generate chunk ranges CSV for distributed runs
+├── results/                           Analysis output (parquet files)
+└── README.md
 ```
 
 ## Setup
@@ -69,59 +65,59 @@ eth-mempool-analysis/
 ### Prerequisites
 
 ```bash
-cd ~/eth-mempool-analysis
 pip install -r requirements.txt
 ```
 
 ### Configuration
 
-Edit `config/config.yaml` with ClickHouse credentials:
+Create a `.env` file in the project root or set environment variables:
+
+```
+CLICKHOUSE_URL=https://clickhouse.xatu.ethpandaops.io
+CLICKHOUSE_USER=your_username
+CLICKHOUSE_PASSWORD=your_password
+```
+
+Analysis parameters in `config/config.yaml`:
 
 ```yaml
-clickhouse:
-  url: "https://your-server.com:8123"
-  user: "your_username"
-  password: "your_password"
-  database: "default"
-
 analysis:
-  # Inclusion list time window
-  time_window_start_secs: -4
-  time_window_end_secs: 8
-
-  # Censorship detection parameters
-  censorship_dwell_time_secs: 12        # Minimum time in mempool (1 slot)
-  censorship_fee_percentile: 0.25       # Fee threshold (25th percentile)
-  censorship_percentile_window_secs: 30 # Time window for percentile calculation
+  start_block: 21575000
+  end_block: 21576000
+  time_window_start_secs: -20       # ~2 slots lookback
+  time_window_end_secs: 8           # 8s after block timestamp
+  censorship_dwell_time_secs: 12    # Minimum mempool dwell (1 slot)
+  censorship_fee_percentile: 0.50   # Median fee threshold for censorship
+  censorship_percentile_window_secs: 30
+  batch_size_blocks: 100
 ```
 
 ## Usage
 
-### Running the Analysis
+### Quick Start
 
 ```bash
-cd scripts
-python focil_censorship_analysis.py
+python scripts/focil_censorship_analysis.py
 ```
 
-The script reads configuration from `config/config.yaml` and processes the specified block range.
+### Override block range via CLI
 
-### Configuration
-
-Edit `config/config.yaml` to set the block range:
-
-```yaml
-analysis:
-  start_block: 21575000      # Starting block number
-  end_block: 21575500        # Ending block number
-  batch_size_blocks: 100     # Blocks per batch (adjust for memory constraints)
+```bash
+python scripts/focil_censorship_analysis.py --start 21575000 --end 21576000
 ```
 
-### Output
+### Large-Scale Batch Processing
 
-The script generates:
-- Console summary with aggregate statistics
-- Parquet file: `results/focil_censorship_analysis.parquet`
+```bash
+# Process a large range in parallel chunks
+python scripts/batch_runner.py 19272000 21900000 --chunk-size 10000 --parallel 4
+
+# Resume (skips already-completed chunks)
+python scripts/batch_runner.py 19272000 21900000 --chunk-size 10000 --resume
+
+# Combine chunk results into a single file
+python scripts/combine_chunks.py
+```
 
 ## Methodology
 
@@ -129,157 +125,56 @@ The script generates:
 
 Transactions are flagged as censored when all criteria are met:
 
-1. **FOCIL-valid**: Transaction fee cap exceeds block base fee
-2. **Competitive fee**: Priority fee at or above 25th percentile of mempool
-3. **Sufficient dwell time**: Present in mempool for at least 12 seconds
-4. **Not user-replaced**: Excluded from nonce replacement set
-5. **Not included**: Remains in mempool after block publication
+1. **FOCIL-valid**: `max_fee >= base_fee`
+2. **Competitive fee**: effective priority fee >= 50th percentile of mempool
+3. **Sufficient dwell time**: in mempool >= 12 seconds (no upper cap)
+4. **Not user-replaced**: excluded from nonce replacement set
+5. **Dual capacity check**: gas fits in both previous and current block
+6. **Not already included**: not in any block up to and including block N (IL builder can't see future)
+7. **EIP-1559 only**: type 2 transactions (filters phantom/spam)
 
 ### Nonce Replacement Detection
 
-To prevent false positive censorship flags:
-
-```python
-# Group transactions by (sender, nonce)
-# Identify highest-fee transaction as final version
-# Mark all other transactions in group as user replacements
-# Exclude replacements from censorship detection
-```
+For each (sender, nonce) pair with multiple transactions:
+- If one was included on-chain, all others are marked as replaced
+- If none were included, the highest `max_fee` tx is kept (matches geth mempool behavior)
 
 ### Inclusion List Construction
 
-**L₀ Construction:**
-```python
-# Filter transactions by base fee
-# Sort by priority fee (descending)
-# Select top-N until 8 KiB size cap
-```
+**Top Fee**: Filter mempool window to FOCIL-valid EIP-1559 txs, sort by effective priority fee descending, pack into 8 KiB cap (skip oversized txs, don't stop).
 
-**L₋₁ and L₋₂ Construction:**
-```python
-# Detect censored transactions at block N-1 or N-2
-# Sort censored transactions by priority fee (descending)
-# Pack until 8 KiB size cap
-```
+**Censored**: Use pre-flagged censored txs, revalidate against current base fee, pack into 8 KiB cap.
 
-## Results
+### Inclusion Rate (Redundancy)
 
-### Data Schema
+These are mock ILs -- nothing is forced on-chain. The inclusion rate measures what percentage of IL transactions were naturally included by builders without FOCIL enforcement. Higher rates at higher delays are expected since there are more blocks to check.
 
-The output Parquet file contains per-block metrics:
+## Output Schema
+
+The output Parquet file contains one row per block:
 
 **Block metadata:**
-- `block_number`, `block_timestamp`, `base_fee`, `included_tx_count`
+- `block_number`, `block_timestamp`, `base_fee`, `gas_used`, `gas_limit`, `included_tx_count`
 
-**L₀ metrics:**
-- `L0_tx_count`, `L0_size_bytes`
+**Mempool diagnostics:**
+- `mempool_coverage_of_next_block` - % of N+1 block txs visible in mempool window
+- `mempool_unique_txs_in_window` - unique tx count in mempool window
 
-**L₋₁ metrics:**
-- `L1_tx_count` - Transactions in inclusion list (after size cap)
-- `L1_size_bytes` - Inclusion list size
-- `L1_censored_tx_count` - Total censored transactions detected
-- `L0_L1_intersection_count` - Overlap with L₀
-- `L0_L1_intersection_bytes` - Overlap size
-- `L1_effective_bytes` - Bandwidth after deduplication
-- `L1_bandwidth_saved` - Bytes saved
-- `L1_savings_pct` - Savings percentage
+**Per-variant columns** (for each of `{0,1,2}delay_{topfee,censored}`):
+- `{variant}_tx_count` - number of transactions in the IL
+- `{variant}_size_bytes` - IL size in bytes
+- `{variant}_inclusion_rate` - % of IL txs naturally included (redundancy)
 
-**L₋₂ metrics:**
-- Similar structure to L₋₁
+**Censorship detection:**
+- `censored_detected_count` - total censored txs detected at this block
 
-### Example Analysis
+## Notes
 
-```python
-import pandas as pd
-
-# Load results
-df = pd.read_parquet('results/focil_censorship_analysis.parquet')
-
-# Summary statistics
-print(f"Blocks analyzed: {len(df)}")
-print(f"Mean censored transactions (N-1): {df['L1_censored_tx_count'].mean():.2f}")
-print(f"Blocks with censorship: {(df['L1_censored_tx_count'] > 0).sum()}")
-
-# Identify blocks with censorship
-censored_blocks = df[df['L1_censored_tx_count'] > 0]
-print(censored_blocks[['block_number', 'L1_censored_tx_count', 'L2_censored_tx_count']])
-```
-
-### Empirical Findings
-
-Analysis of blocks 21,575,000 - 21,575,497 (January 2025):
-
-**Censorship Prevalence:**
-- 4.8% of blocks contained censored transactions
-- Mean: 0.2 censored transactions per block
-- 24 blocks out of 497 showed censorship activity
-
-**Nonce Replacements:**
-- 45% of mempool transactions are user-initiated replacements
-- Critical for avoiding false positive censorship detection
-
-**Inclusion List Characteristics:**
-- L₀ mean size: 6.26 KiB (16.0 transactions)
-- L₋₁ mean size: 0.02 KiB (0.1 transactions)
-- L₋₂ mean size: 0.02 KiB (0.1 transactions)
-
-**Overlap Analysis:**
-- Negligible overlap between L₀ and L₋₁/L₋₂
-- Censored transactions typically have competitive but not highest fees
-
-## Technical Details
-
-### Time Window
-
-Transactions are considered for inclusion if first seen within:
-```
-[block_timestamp - 4 seconds, block_timestamp + 8 seconds]
-```
-
-### Fee Percentile Calculation
-
-Configurable via `censorship_fee_percentile` (default: 0.25). Calculated from mempool transactions observed within the window defined by `censorship_percentile_window_secs` (default: 30 seconds):
-```
-[block_timestamp - censorship_percentile_window_secs, block_timestamp]
-```
-
-### Dwell Time
-
-Configurable via `censorship_dwell_time_secs` (default: 12 seconds, approximately 1 slot)
-
-### Size Cap
-
-EIP-7805 specification: 8,192 bytes (8 KiB) maximum per inclusion list
-
-## Performance
-
-### Processing Time
-
-- Approximately 0.4 seconds per block
-- 100 blocks: ~40 seconds
-- 500 blocks: ~3 minutes
-- Batch processing recommended for large ranges
-
-### Memory Usage
-
-- Batch size: 100 blocks
-- Peak memory: ~500 MB per batch
-- Scales linearly with batch size
+- ClickHouse (Xatu) is distributed: JOINs across tables are denied. All joins are done in Python.
+- ~72.7% of block txs appear in the public mempool (based on empirical analysis).
+- Top ~50-100 txs by raw fee are typically phantom/spam (legacy type 0, 0s observation spread, inactive senders). The type 2 filter eliminates these.
 
 ## Reference
 
-Research specification: https://hackmd.io/@pellekrab/HkzMiXkmZe
-
-## Citation
-
-```bibtex
-@misc{eth_focil_censorship_2025,
-  title={FOCIL-based Transaction Censorship Analysis on Ethereum},
-  year={2025},
-  howpublished={\url{https://github.com/yourusername/eth-mempool-analysis}}
-}
-```
-
-## License
-
-MIT
+- [FOCIL Research Specification](https://hackmd.io/@pellekrab/HkzMiXkmZe)
+- [EIP-7805: FOCIL](https://eips.ethereum.org/EIPS/eip-7805)
