@@ -218,7 +218,7 @@ def construct_il_variant(
     base_fee: int,
     blocks_df: pd.DataFrame,
     censored_txs: pd.DataFrame,
-    exclusion_tracker: dict,
+    already_included: set,
     config: dict,
     max_bytes: int = MAX_IL_BYTES,
 ) -> pd.DataFrame:
@@ -229,6 +229,8 @@ def construct_il_variant(
 
     For censored: uses pre-flagged censored transactions, revalidated against
     the current block's base fee.
+
+    Excludes txs already confirmed on-chain (already_included).
     """
     variant_name = f"{delay}delay_{variant_type}"
     window_start = config['analysis']['time_window_start_secs']
@@ -273,10 +275,9 @@ def construct_il_variant(
     candidates = candidates.sort_values('effective_priority_fee', ascending=False)
     candidates = candidates.drop_duplicates(subset='tx_hash', keep='first')
 
-    # Step 3: Exclude txs already included via previous ILs
-    excluded = exclusion_tracker.get(variant_name, set())
-    if excluded:
-        candidates = candidates[~candidates['tx_hash'].isin(excluded)]
+    # Step 3: Exclude txs already confirmed on-chain
+    if already_included:
+        candidates = candidates[~candidates['tx_hash'].isin(already_included)]
 
     if len(candidates) == 0:
         return pd.DataFrame()
@@ -392,11 +393,10 @@ def process_single_block(
     mempool_df: pd.DataFrame,
     included_txs_map: dict,
     replaced_txs: set,
-    exclusion_tracker: dict,
     config: dict,
     collect_metrics: bool = False,
 ) -> dict | None:
-    """Process a single block: build all 6 IL variants, update exclusion tracker.
+    """Process a single block: build all 6 IL variants.
 
     When collect_metrics=True, returns a dict of per-block metrics.
     When False (warm-up), returns None.
@@ -434,13 +434,16 @@ def process_single_block(
         )
         result['mempool_unique_txs_in_window'] = len(window_hashes)
 
+    # Txs already on-chain when IL is built at block N (includes block N itself)
+    already_included = set()
+    for bn, txs in included_txs_map.items():
+        if bn <= block_num:
+            already_included |= txs
+
     # Compute active senders: mempool senders with at least one tx included
     # in any block before the current one. This filters phantom/spam senders
     # without using forward-looking data.
-    all_included_before = set()
-    for bn, txs in included_txs_map.items():
-        if bn < block_num:
-            all_included_before |= txs
+    all_included_before = already_included - included_txs_map.get(block_num, set())
     mempool_senders_with_inclusion = mempool_df[
         mempool_df['tx_hash'].isin(all_included_before)
     ]['sender'].unique()
@@ -493,7 +496,7 @@ def process_single_block(
                 base_fee=base_fee,
                 blocks_df=blocks_df,
                 censored_txs=censored_txs,
-                exclusion_tracker=exclusion_tracker,
+                already_included=already_included,
                 config=config,
             )
 
@@ -523,29 +526,14 @@ def process_single_block(
                 else:
                     result[f'{variant_name}_inclusion_rate'] = None
 
-            # Update exclusion tracker: check all blocks from construction
-            # through enforcement (N-delay+1 to N+1) for actual inclusion
-            if len(il_df) > 0:
-                included_in_range = set()
-                for bn in range(block_num - delay + 1, block_num + 2):
-                    included_in_range |= included_txs_map.get(bn, set())
-                il_hashes = set(il_df['tx_hash'])
-                actually_included = il_hashes & included_in_range
-                exclusion_tracker[variant_name].update(actually_included)
-
-                if collect_metrics:
-                    result[f'{variant_name}_actually_included'] = len(actually_included)
-            elif collect_metrics:
-                result[f'{variant_name}_actually_included'] = 0
-
     return result
 
 
 def analyze_block_range(start_block: int, end_block: int, config: dict):
     """6-variant FOCIL analysis with verified deduplication.
 
-    Processes blocks sequentially with a 3-block warm-up phase to populate
-    the exclusion tracker before collecting metrics.
+    Processes blocks sequentially with a 3-block warm-up phase before
+    collecting metrics.
     """
     log.info("Analyzing blocks %d to %d", start_block, end_block)
 
@@ -613,9 +601,6 @@ def analyze_block_range(start_block: int, end_block: int, config: dict):
     replaced_txs = detect_nonce_replacements(mempool_df, included_txs_map)
     log.info("Found %d replaced transactions", len(replaced_txs))
 
-    # Initialize exclusion tracker
-    exclusion_tracker = {name: set() for name in VARIANT_NAMES}
-
     # Warm-up phase (3 blocks before start)
     log.info("Warm-up phase (3 blocks)...")
     warmup = blocks_df[
@@ -625,7 +610,7 @@ def analyze_block_range(start_block: int, end_block: int, config: dict):
     for _, block_row in warmup.iterrows():
         process_single_block(
             block_row, blocks_df, mempool_df, included_txs_map,
-            replaced_txs, exclusion_tracker, config,
+            replaced_txs, config,
             collect_metrics=False,
         )
 
@@ -640,7 +625,7 @@ def analyze_block_range(start_block: int, end_block: int, config: dict):
     for _, block_row in tqdm(main_blocks.iterrows(), total=len(main_blocks), desc="  Processing"):
         row = process_single_block(
             block_row, blocks_df, mempool_df, included_txs_map,
-            replaced_txs, exclusion_tracker, config,
+            replaced_txs, config,
             collect_metrics=True,
         )
         if row:
