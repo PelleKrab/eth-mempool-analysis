@@ -5,17 +5,14 @@ Test ClickHouse connection and basic queries
 
 import sys
 from pathlib import Path
-import yaml
+
+from focil_censorship_analysis import load_config
 
 
 def test_connection():
     """Test basic ClickHouse connection"""
 
-    # Load config
-    config_file = Path(__file__).parent.parent / "config" / "config.yaml"
-    with open(config_file, 'r') as f:
-        config = yaml.safe_load(f)
-
+    config = load_config()
     ch_config = config['clickhouse']
 
     print("Testing ClickHouse connection...")

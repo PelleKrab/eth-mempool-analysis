@@ -100,10 +100,12 @@ analysis:
 python scripts/focil_censorship_analysis.py
 ```
 
-### Override block range via CLI
+### Override block range
+
+Edit `config/config.yaml` to set `start_block` and `end_block`, then re-run:
 
 ```bash
-python scripts/focil_censorship_analysis.py --start 21575000 --end 21576000
+python scripts/focil_censorship_analysis.py
 ```
 
 ### Large-Scale Batch Processing

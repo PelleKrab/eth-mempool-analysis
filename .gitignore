@@ -28,6 +28,19 @@ logs/
 config/config.yaml
 .env
 
+# Runtime artifacts
+*.pid
+timing_output.txt
+monitor_progress.sh
+chunk_ranges.csv
+batch.log
+
+# Redundant docs (README covers these topics)
+BATCH_PROCESSING.md
+QUICK_START_BATCH.md
+TIMING_BENCHMARK.md
+TODO.md
+
 # OS
 .DS_Store
 Thumbs.db
