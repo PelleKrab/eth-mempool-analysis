@@ -6,7 +6,7 @@ Test ClickHouse connection and basic queries
 import sys
 from pathlib import Path
 
-from focil_censorship_analysis import load_config
+from utils import load_config
 
 
 def test_connection():

@@ -19,34 +19,38 @@ from pathlib import Path
 # Add parent directory to path to import the main script
 sys.path.insert(0, str(Path(__file__).parent))
 
-from focil_censorship_analysis import analyze_block_range, load_config, print_summary
+from utils import load_config, AddressCache
+from focil_censorship_analysis import analyze_block_range, print_summary
 import pandas as pd
 
 log = logging.getLogger(__name__)
 
 
-def run_chunk(chunk_start: int, chunk_end: int, chunk_id: int, output_dir: Path):
+def run_chunk(chunk_start: int, chunk_end: int, chunk_id: int, output_dir: Path,
+              address_cache: AddressCache | None = None):
     """Run analysis on a single chunk and save results."""
     try:
         log.info(f"[Chunk {chunk_id}] Processing blocks {chunk_start:,} to {chunk_end:,}")
 
         config = load_config()
-        result_df = analyze_block_range(chunk_start, chunk_end, config)
+        result_df, address_cache = analyze_block_range(
+            chunk_start, chunk_end, config, address_cache=address_cache,
+        )
 
         if result_df is None or len(result_df) == 0:
             log.warning(f"[Chunk {chunk_id}] No results produced")
-            return None
+            return None, address_cache
 
         # Save chunk results
         output_file = output_dir / f"chunk_{chunk_id:04d}_{chunk_start}_{chunk_end}.parquet"
         result_df.to_parquet(output_file, index=False)
 
         log.info(f"[Chunk {chunk_id}] Saved {len(result_df):,} blocks to {output_file.name}")
-        return output_file
+        return output_file, address_cache
 
     except Exception as e:
         log.error(f"[Chunk {chunk_id}] Failed: {e}", exc_info=True)
-        return None
+        return None, address_cache
 
 
 def main():
@@ -115,16 +119,28 @@ def main():
     completed = 0
     failed = 0
 
+    # Address cache persists across sequential chunks so each batch only
+    # queries genuinely new addresses against ClickHouse.
+    address_cache = AddressCache()
+
     if args.parallel == 1:
-        # Sequential processing
+        # Sequential processing — cache accumulates across chunks
         for chunk_start, chunk_end, chunk_id, out_dir in chunks:
-            result = run_chunk(chunk_start, chunk_end, chunk_id, out_dir)
+            result, address_cache = run_chunk(
+                chunk_start, chunk_end, chunk_id, out_dir,
+                address_cache=address_cache,
+            )
             if result:
                 completed += 1
             else:
                 failed += 1
+            log.info(f"Address cache: {len(address_cache.checked):,} checked, "
+                     f"{len(address_cache.active):,} active")
     else:
-        # Parallel processing
+        # Parallel processing — each worker gets its own cache (no sharing)
+        log.warning("Parallel mode: address cache cannot be shared between workers. "
+                    "Each chunk will query independently. Use sequential mode for "
+                    "best cache efficiency.")
         with ProcessPoolExecutor(max_workers=args.parallel) as executor:
             futures = {
                 executor.submit(run_chunk, start, end, cid, out_dir): cid
@@ -134,7 +150,7 @@ def main():
             for future in as_completed(futures):
                 chunk_id = futures[future]
                 try:
-                    result = future.result()
+                    result, _ = future.result()
                     if result:
                         completed += 1
                     else:
