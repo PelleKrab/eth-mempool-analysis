@@ -4,7 +4,7 @@ Analysis framework for studying transaction censorship patterns on Ethereum usin
 
 ## Overview
 
-This project analyzes historical Ethereum mempool data to construct mock inclusion lists and measure how many of those transactions builders naturally include. The analysis produces 6 variants per block: 2 strategies (top fee, censored) evaluated at 3 delay levels (0, 1, 2 slots).
+This project analyzes historical Ethereum mempool data to construct mock inclusion lists and measure how many of those transactions builders naturally include. Two ILs are built per block (top fee, censored) and each is evaluated for redundancy at 3 delay levels (0, 1, 2 slots).
 
 ### Inclusion List Strategies
 
@@ -38,8 +38,8 @@ ClickHouse (Xatu)       Python Script                   Output
 │ mempool_         │────>│ focil_censorship_        │────>│ .parquet     │
 │   transaction    │     │   analysis.py            │     │ per-block    │
 │ canonical_       │────>│                          │     │ metrics      │
-│   beacon_block   │     │ 6 variants per block:    │     └──────────────┘
-│ canonical_       │────>│  3 delays x 2 strategies │
+│   beacon_block   │     │ 2 ILs per block,         │     └──────────────┘
+│ canonical_       │────>│ redundancy at 3 delays   │
 │   execution_     │     └─────────────────────────┘
 │   transaction    │
 └─────────────────┘
@@ -52,10 +52,15 @@ eth-mempool-analysis/
 ├── config/
 │   └── config.yaml                    Configuration (ClickHouse creds + analysis params)
 ├── scripts/
-│   ├── focil_censorship_analysis.py   Main analysis script
+│   ├── focil_censorship_analysis.py   Main analysis (Xatu mempool data)
+│   ├── bn_focil_analysis.py           Same analysis using BlockNative data
+│   ├── mempool_source_comparison.py   Side-by-side Xatu vs BlockNative comparison
+│   ├── utils.py                       Shared utilities (config, queries, IL packing)
 │   ├── batch_runner.py                Parallel batch processing for large ranges
 │   ├── combine_chunks.py             Combine chunk parquets into one file
-│   └── generate_chunk_ranges.py       Generate chunk ranges CSV for distributed runs
+│   ├── generate_chunk_ranges.py       Generate chunk ranges CSV for distributed runs
+│   ├── verify_data_quality.py         Data quality checks on output parquet files
+│   └── test_connection.py             ClickHouse connectivity test
 ├── results/                           Analysis output (parquet files)
 └── README.md
 ```
@@ -82,13 +87,15 @@ Analysis parameters in `config/config.yaml`:
 
 ```yaml
 analysis:
-  start_block: 21575000
-  end_block: 21576000
-  time_window_start_secs: -20       # ~2 slots lookback
-  time_window_end_secs: 8           # 8s after block timestamp
+  start_block: 21750000
+  end_block: 21750100
+  topfee_window_start_secs: -4      # Top fee window start (relative to block timestamp)
+  topfee_window_end_secs: 8         # Top fee window end
+  censored_window_start_secs: -12   # Censored window start (previous slot)
+  censored_window_end_secs: 0       # Censored window end
   censorship_dwell_time_secs: 12    # Minimum mempool dwell (1 slot)
+  censorship_max_dwell_time_secs: 12  # Maximum dwell (1 slot, no overlap with prior)
   censorship_fee_percentile: 0.50   # Median fee threshold for censorship
-  censorship_percentile_window_secs: 30
   batch_size_blocks: 100
 ```
 
@@ -129,11 +136,12 @@ Transactions are flagged as censored when all criteria are met:
 
 1. **FOCIL-valid**: `max_fee >= base_fee`
 2. **Competitive fee**: effective priority fee >= 50th percentile of mempool
-3. **Sufficient dwell time**: in mempool >= 12 seconds (no upper cap)
+3. **Sufficient dwell time**: in mempool >= 12 seconds, capped at 12 seconds (1 slot)
 4. **Not user-replaced**: excluded from nonce replacement set
 5. **Dual capacity check**: gas fits in both previous and current block
 6. **Not already included**: not in any block up to and including block N (IL builder can't see future)
-7. **EIP-1559 only**: type 2 transactions (filters phantom/spam)
+7. **Active sender**: sender has on-chain activity in recent blocks (filters phantom/spam)
+8. **EIP-1559 only**: type 2 transactions (additional phantom filter, Xatu pipeline only)
 
 ### Nonce Replacement Detection
 
@@ -166,6 +174,8 @@ The output Parquet file contains one row per block:
 - `{variant}_tx_count` - number of transactions in the IL
 - `{variant}_size_bytes` - IL size in bytes
 - `{variant}_inclusion_rate` - % of IL txs naturally included (redundancy)
+- `{variant}_useful_bytes` - IL bytes for txs NOT naturally included
+- `{variant}_redundant_bytes` - IL bytes for txs that were naturally included
 
 **Censorship detection:**
 - `censored_detected_count` - total censored txs detected at this block
