@@ -35,9 +35,13 @@ monitor_progress.sh
 chunk_ranges.csv
 batch.log
 
+# Standalone SQL queries (all queries are inline in Python scripts)
+queries/
+
 # Redundant docs (README covers these topics)
 BATCH_PROCESSING.md
 QUICK_START_BATCH.md
+QUICKSTART.md
 TIMING_BENCHMARK.md
 TODO.md
 
