@@ -19,29 +19,58 @@ from pathlib import Path
 # Add parent directory to path to import the main script
 sys.path.insert(0, str(Path(__file__).parent))
 
-from utils import load_config, AddressCache
+from utils import load_config, AddressCache, pre_seed_address_cache
 from focil_censorship_analysis import analyze_block_range, print_summary
 import pandas as pd
 
 log = logging.getLogger(__name__)
 
+# Max blocks per ClickHouse query — keeps mempool queries fast (~5-10s each)
+XATU_BATCH_SIZE = 500
+
 
 def run_chunk(chunk_start: int, chunk_end: int, chunk_id: int, output_dir: Path,
-              address_cache: AddressCache | None = None):
-    """Run analysis on a single chunk and save results."""
+              address_cache: AddressCache | None = None,
+              cache_file: str | None = None):
+    """Run analysis on a single chunk and save results.
+
+    Internally sub-batches in XATU_BATCH_SIZE increments to avoid issuing
+    one giant ClickHouse mempool query per chunk.
+
+    In parallel mode, address_cache is None and cache_file is used instead —
+    each worker loads the pre-seeded cache from disk independently.
+    """
     try:
-        log.info(f"[Chunk {chunk_id}] Processing blocks {chunk_start:,} to {chunk_end:,}")
+        log.info(f"[Chunk {chunk_id}] Processing blocks {chunk_start:,} to {chunk_end:,} "
+                 f"in {XATU_BATCH_SIZE}-block sub-batches")
 
         config = load_config()
-        result_df, address_cache = analyze_block_range(
-            chunk_start, chunk_end, config, address_cache=address_cache,
-        )
 
-        if result_df is None or len(result_df) == 0:
+        # Parallel workers load from disk; sequential workers share in-memory cache
+        if address_cache is None and cache_file:
+            address_cache = AddressCache.load(cache_file)
+
+        batch_results = []
+        total_batches = (chunk_end - chunk_start + XATU_BATCH_SIZE - 1) // XATU_BATCH_SIZE
+
+        for batch_num, batch_start in enumerate(range(chunk_start, chunk_end, XATU_BATCH_SIZE), 1):
+            batch_end = min(batch_start + XATU_BATCH_SIZE, chunk_end)
+            log.info(f"[Chunk {chunk_id}] Sub-batch {batch_num}/{total_batches}: "
+                     f"blocks {batch_start:,}-{batch_end:,}")
+
+            result_df, address_cache = analyze_block_range(
+                batch_start, batch_end, config, address_cache=address_cache,
+            )
+
+            if result_df is not None and len(result_df) > 0:
+                batch_results.append(result_df)
+
+        if not batch_results:
             log.warning(f"[Chunk {chunk_id}] No results produced")
             return None, address_cache
 
-        # Save chunk results
+        result_df = pd.concat(batch_results, ignore_index=True)
+
         output_file = output_dir / f"chunk_{chunk_id:04d}_{chunk_start}_{chunk_end}.parquet"
         result_df.to_parquet(output_file, index=False)
 
@@ -65,6 +94,12 @@ def main():
                        help="Directory for chunk outputs")
     parser.add_argument("--resume", action="store_true",
                        help="Skip chunks that already have output files")
+    parser.add_argument("--cache-file", type=str, default="results/address_cache.pkl",
+                       help="Path to pre-seeded address cache file (default: results/address_cache.pkl)")
+    parser.add_argument("--seed-start", type=int, default=None,
+                       help="Start block for pre-seeding cache (e.g. 16308190 for Jan 2023)")
+    parser.add_argument("--seed-end", type=int, default=None,
+                       help="End block for pre-seeding cache (e.g. 18908895 for Jan 2024)")
 
     args = parser.parse_args()
 
@@ -113,18 +148,29 @@ def main():
         log.info("All chunks already processed!")
         return 0
 
+    # Pre-seed address cache from a prior block range (e.g. full 2023).
+    # Saves to disk so it's only built once; parallel workers each load it.
+    cache_file = str(Path(__file__).parent.parent / args.cache_file)
+    config = load_config()
+
+    if args.seed_start and args.seed_end:
+        log.info("Pre-seeding address cache from blocks %d to %d...",
+                 args.seed_start, args.seed_end)
+        address_cache = pre_seed_address_cache(
+            args.seed_start, args.seed_end, config, cache_file=cache_file,
+        )
+    else:
+        address_cache = AddressCache.load(cache_file)
+
+    log.info("Address cache ready: %d checked, %d active",
+             len(address_cache.checked), len(address_cache.active))
     log.info(f"Processing {len(chunks):,} chunks...")
 
-    # Run chunks
     completed = 0
     failed = 0
 
-    # Address cache persists across sequential chunks so each batch only
-    # queries genuinely new addresses against ClickHouse.
-    address_cache = AddressCache()
-
     if args.parallel == 1:
-        # Sequential processing — cache accumulates across chunks
+        # Sequential — cache accumulates in memory across chunks
         for chunk_start, chunk_end, chunk_id, out_dir in chunks:
             result, address_cache = run_chunk(
                 chunk_start, chunk_end, chunk_id, out_dir,
@@ -137,13 +183,13 @@ def main():
             log.info(f"Address cache: {len(address_cache.checked):,} checked, "
                      f"{len(address_cache.active):,} active")
     else:
-        # Parallel processing — each worker gets its own cache (no sharing)
-        log.warning("Parallel mode: address cache cannot be shared between workers. "
-                    "Each chunk will query independently. Use sequential mode for "
-                    "best cache efficiency.")
+        # Parallel — each worker loads the pre-seeded cache from disk
+        log.info(f"Parallel mode: {args.parallel} workers, "
+                 f"each loading cache from {cache_file}")
         with ProcessPoolExecutor(max_workers=args.parallel) as executor:
             futures = {
-                executor.submit(run_chunk, start, end, cid, out_dir): cid
+                executor.submit(run_chunk, start, end, cid, out_dir,
+                                None, cache_file): cid
                 for start, end, cid, out_dir in chunks
             }
 
