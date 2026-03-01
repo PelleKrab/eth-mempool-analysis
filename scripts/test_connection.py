@@ -138,7 +138,7 @@ def test_connection():
         print("✓ All tests passed!")
         print("="*60)
         print("\nYou're ready to run the batch processor:")
-        print(f"  python batch_processor.py --start-block {test_start} --end-block {max_block} --batch-size 1000")
+        print(f"  python scripts/batch_runner.py {test_start} {max_block} --chunk-size 1000")
 
     except Exception as e:
         print(f"\n✗ Connection failed: {e}")

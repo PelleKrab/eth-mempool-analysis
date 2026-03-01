@@ -57,14 +57,17 @@ def verify_data_quality(parquet_file: Path) -> bool:
         'included_tx_count', 'mempool_coverage_of_next_block',
         'mempool_unique_txs_in_window', 'censored_detected_count'
     ]
-    # Add variant columns (6 variants × 3 metrics each = 18 columns)
-    variants = ['0delay_topfee', '1delay_topfee', '2delay_topfee',
-                '0delay_censored', '1delay_censored', '2delay_censored']
+    # 2 ILs x 3 delay evaluations = 6 column prefixes, 5 metrics each
+    variants = ['0delay_topfee', '0delay_censored',
+                '1delay_topfee', '1delay_censored',
+                '2delay_topfee', '2delay_censored']
     for variant in variants:
         expected_cols.extend([
             f'{variant}_tx_count',
             f'{variant}_size_bytes',
-            f'{variant}_inclusion_rate'
+            f'{variant}_inclusion_rate',
+            f'{variant}_useful_bytes',
+            f'{variant}_redundant_bytes',
         ])
 
     missing_cols = set(expected_cols) - set(df.columns)

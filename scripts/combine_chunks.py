@@ -24,7 +24,7 @@ def combine_chunks(input_dir: Path, output_file: Path, verbose: bool = False):
     """Combine all chunk parquet files into a single file."""
 
     # Find all chunk files
-    chunk_files = sorted(input_dir.glob("chunk_*.parquet"))
+    chunk_files = sorted(input_dir.glob("*chunk_*.parquet"))
 
     if not chunk_files:
         log.error(f"No chunk files found in {input_dir}")

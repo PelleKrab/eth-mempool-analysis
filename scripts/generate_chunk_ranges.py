@@ -53,10 +53,10 @@ def main():
         writer.writerows(ranges)
 
     print(f"\nSaved {len(ranges):,} chunks to: {output_file}")
-    print("\nTo run a specific chunk:")
-    print(f"  python scripts/focil_censorship_analysis.py --start <start_block> --end <end_block>")
-    print("\nOr use batch_runner.py:")
+    print("\nTo run all chunks (Xatu):")
     print(f"  python scripts/batch_runner.py {args.start_block} {args.end_block} --chunk-size {args.chunk_size}")
+    print("\nTo run all chunks (BlockNative):")
+    print(f"  python scripts/bn_focil_analysis.py {args.start_block} {args.end_block} --chunk-size {args.chunk_size}")
 
 
 if __name__ == "__main__":
