@@ -24,10 +24,15 @@ MAX_IL_BYTES = 8192  # 8 KiB
 BLOB_TX_TYPE = 3     # EIP-4844
 TX_OVERHEAD_BYTES = 125  # Signature + nonce + gas fields + addresses (for BN size estimation)
 
+# IL strategies (2 ILs built per slot)
+IL_STRATEGIES = ['topfee', 'censored']
+
+# Delay levels for redundancy evaluation
+DELAY_LEVELS = [0, 1, 2]
+
+# Column prefixes: {delay}delay_{strategy} for each metric
 VARIANT_NAMES = [
-    '0delay_topfee', '0delay_censored',
-    '1delay_topfee', '1delay_censored',
-    '2delay_topfee', '2delay_censored',
+    f'{d}delay_{s}' for d in DELAY_LEVELS for s in IL_STRATEGIES
 ]
 
 
@@ -88,7 +93,7 @@ def execute_query(query: str, config: dict, max_retries: int = 3) -> pd.DataFram
             )
             if response.status_code != 200:
                 raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
-            return pd.read_csv(io.StringIO(response.text), na_values=['\\N'])
+            return pd.read_csv(io.StringIO(response.text), na_values=['\\N'], low_memory=False)
         except (requests.RequestException, RuntimeError) as exc:
             if attempt < max_retries - 1:
                 wait = 2 ** attempt
@@ -176,6 +181,86 @@ class AddressCache:
     def unchecked(self, addresses: set) -> set:
         """Return addresses we haven't looked up yet."""
         return addresses - self.checked
+
+    def save(self, path) -> None:
+        """Save cache to disk as a pickle file."""
+        import pickle
+        with open(path, 'wb') as f:
+            pickle.dump({'active': self.active, 'checked': self.checked}, f)
+        log.info("Saved address cache to %s (%d checked, %d active)",
+                 path, len(self.checked), len(self.active))
+
+    @classmethod
+    def load(cls, path) -> 'AddressCache':
+        """Load cache from disk. Returns empty cache if file missing."""
+        import pickle
+        cache = cls()
+        try:
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
+            cache.active = data['active']
+            cache.checked = data['checked']
+            log.info("Loaded address cache from %s (%d checked, %d active)",
+                     path, len(cache.checked), len(cache.active))
+        except FileNotFoundError:
+            log.info("No cache file at %s, starting fresh", path)
+        return cache
+
+
+def pre_seed_address_cache(seed_start: int, seed_end: int, config: dict,
+                           cache_file: str | None = None,
+                           scan_chunk: int = 100_000) -> 'AddressCache':
+    """Build an AddressCache by scanning all tx senders in a block range.
+
+    Uses the block_number primary key so the scan is fast even over millions
+    of blocks. Intended to be run once before the main analysis to pre-seed
+    the cache with all known senders from a prior period (e.g. 2023).
+
+    Args:
+        seed_start: First block to scan (inclusive).
+        seed_end: Last block to scan (exclusive).
+        config: ClickHouse config dict.
+        cache_file: If given, save the resulting cache here and load it
+                    on future runs instead of re-scanning.
+        scan_chunk: Blocks per ClickHouse query (default 100k ≈ 17s each).
+    """
+    import pickle
+
+    if cache_file:
+        try:
+            cache = AddressCache.load(cache_file)
+            if cache.checked:
+                return cache
+        except Exception:
+            pass
+
+    cache = AddressCache()
+    total_chunks = (seed_end - seed_start + scan_chunk - 1) // scan_chunk
+    log.info("Pre-seeding address cache from blocks %d-%d (%d chunks of %dk)...",
+             seed_start, seed_end, total_chunks, scan_chunk // 1000)
+
+    for i, block in enumerate(range(seed_start, seed_end, scan_chunk)):
+        chunk_end = min(block + scan_chunk, seed_end)
+        query = f"""
+        SELECT DISTINCT lower(from_address) as address
+        FROM canonical_execution_transaction
+        WHERE block_number >= {block}
+          AND block_number < {chunk_end}
+          AND meta_network_name = 'mainnet'
+        """
+        df = execute_query(query, config)
+        if len(df) > 0:
+            cache.active |= set(df['address'])
+            cache.checked |= set(df['address'])
+        log.info("  Seed chunk %d/%d (blocks %d-%d): %d active total",
+                 i + 1, total_chunks, block, chunk_end, len(cache.active))
+
+    log.info("Pre-seed complete: %d unique senders", len(cache.active))
+
+    if cache_file:
+        cache.save(cache_file)
+
+    return cache
 
 
 def check_addresses_on_chain(addresses: set, ref_block: int, config: dict,
