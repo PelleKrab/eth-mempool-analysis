@@ -2,7 +2,7 @@
 """
 FOCIL Analysis using BlockNative Mempool Data
 
-Same 6-variant FOCIL inclusion list analysis as focil_censorship_analysis.py,
+Same FOCIL inclusion list analysis as focil_censorship_analysis.py,
 but powered by BlockNative's richer mempool data. Key advantages:
 
   - Full tx lifecycle tracking (pending → confirmed/evicted/cancelled)
@@ -17,24 +17,27 @@ Differences from Xatu-based script:
   - Dual inclusion rate: canonical cross-validation + BN native
   - tx_size estimated from datasize + overhead (BN lacks full tx size)
 
-Inclusion List Variants (3 delays × 2 strategies):
-  Top Fee: L0, L-1, L-2 (highest priority fee transactions)
-  Censored: L0, L-1, L-2 (transactions meeting censorship criteria)
+Structure:
+  2 ILs built per slot (Top Fee + Censored).
+  Redundancy evaluated at 3 delay levels (0, 1, 2) per IL.
 
 Reference: EIP-7805 (FOCIL), 8 KiB inclusion list cap.
 """
 
+import argparse
 import logging
+import sys
 
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
 from utils import (
     load_config, execute_query, fetch_block_data, fetch_included_txs,
     pack_il, get_block_int, MAX_IL_BYTES, BLOB_TX_TYPE, TX_OVERHEAD_BYTES,
-    VARIANT_NAMES,
+    IL_STRATEGIES, DELAY_LEVELS, VARIANT_NAMES,
 )
 
 log = logging.getLogger(__name__)
@@ -77,7 +80,6 @@ def fetch_bn_mempool_all(min_ts: int, max_ts: int, config: dict) -> pd.DataFrame
         gas as gas_limit,
         datasize as call_data_size,
         status,
-        stuck,
         timepending,
         blockspending,
         replace
@@ -85,6 +87,7 @@ def fetch_bn_mempool_all(min_ts: int, max_ts: int, config: dict) -> pd.DataFrame
     WHERE detecttime >= toDateTime({int(min_ts)})
       AND detecttime < toDateTime({int(max_ts)})
       AND network = 'main'
+      AND (maxfeepergas IS NOT NULL OR gasprice IS NOT NULL)
     ORDER BY detecttime
     """
     df = execute_query(query, config)
@@ -110,7 +113,6 @@ def build_tx_lifecycle(bn_raw_df: pd.DataFrame) -> pd.DataFrame:
       - timepending_ms: from confirmed event (if available)
       - blocks_pending: from confirmed event (if available)
       - was_replaced: True if cancel/speedup status exists
-      - was_stuck: True if any event had stuck=True
       - tx_size: estimated from call_data_size + overhead
     """
     if len(bn_raw_df) == 0:
@@ -149,29 +151,21 @@ def build_tx_lifecycle(bn_raw_df: pd.DataFrame) -> pd.DataFrame:
     replaced = bn_raw_df[bn_raw_df['status'].isin(['cancel', 'speedup'])].drop_duplicates(
         'tx_hash')[['tx_hash']].assign(was_replaced=True).set_index('tx_hash')
 
-    # Was stuck (any event with stuck=True)
-    stuck = bn_raw_df[bn_raw_df['stuck'].astype(bool)].drop_duplicates(
-        'tx_hash')[['tx_hash']].assign(was_stuck=True).set_index('tx_hash')
-
     # Build lifecycle dataframe
     lifecycle = first_events[['sender', 'nonce', 'event_timestamp', 'max_fee',
                                'priority_fee', 'gas_price', 'tx_type', 'gas_limit',
-                               'call_data_size', 'stuck']].copy()
-    lifecycle = lifecycle.rename(columns={'event_timestamp': 'first_seen',
-                                          'stuck': '_first_stuck'})
-    lifecycle = lifecycle.drop(columns=['_first_stuck'])
+                               'call_data_size']].copy()
+    lifecycle = lifecycle.rename(columns={'event_timestamp': 'first_seen'})
 
     # Join metadata
     lifecycle = lifecycle.join(best_status, how='left')
     lifecycle = lifecycle.join(confirmed_meta, how='left')
     lifecycle = lifecycle.join(was_confirmed, how='left')
     lifecycle = lifecycle.join(replaced, how='left')
-    lifecycle = lifecycle.join(stuck, how='left')
 
     # Fill booleans
     lifecycle['was_confirmed'] = lifecycle['was_confirmed'].fillna(False)
     lifecycle['was_replaced'] = lifecycle['was_replaced'].fillna(False)
-    lifecycle['was_stuck'] = lifecycle['was_stuck'].fillna(False)
 
     # Estimate tx_size
     lifecycle['tx_size'] = lifecycle['call_data_size'].fillna(0) + TX_OVERHEAD_BYTES
@@ -189,13 +183,12 @@ def build_topfee_il(pool_df: pd.DataFrame, base_fee: int,
                     max_bytes: int = MAX_IL_BYTES) -> pd.DataFrame:
     """Build a top-fee IL from lifecycle pool.
 
-    Filters: FOCIL-valid, not blob, not stuck, not already included.
+    Filters: FOCIL-valid, not blob, not already included.
     Allows types 0, 1, 2.
     """
     candidates = pool_df[
         (pool_df['max_fee'] >= base_fee) &
-        (pool_df['tx_type'] != BLOB_TX_TYPE) &
-        (~pool_df['was_stuck'])
+        (pool_df['tx_type'] != BLOB_TX_TYPE)
     ].copy()
 
     if len(candidates) == 0:
@@ -233,12 +226,11 @@ def flag_censored_transactions(
     Criteria:
     1. FOCIL-valid (max_fee >= base_fee)
     2. Competitive effective priority fee (>= configured percentile)
-    3. Not stuck
-    4. Not a blob tx (type != 3)
-    5. Sufficient dwell time (first_seen + dwell_threshold <= block_ts)
-    6. Not replaced (BN cancel/speedup status)
-    7. Not included in relevant blocks (canonical cross-validation)
-    8. Gas fits in both prev and current block
+    3. Not a blob tx (type != 3)
+    4. Sufficient dwell time (first_seen + dwell_threshold <= block_ts)
+    5. Not replaced (BN cancel/speedup status)
+    6. Not included in relevant blocks (canonical cross-validation)
+    7. Gas fits in both prev and current block
     """
     if len(lifecycle_df) == 0:
         return pd.DataFrame()
@@ -247,6 +239,7 @@ def flag_censored_transactions(
     win_end = config['analysis']['censored_window_end_secs']
     fee_pct = config['analysis'].get('censorship_fee_percentile', 0.50)
     min_dwell = config['analysis'].get('censorship_dwell_time_secs', 12)
+    max_dwell = config['analysis'].get('censorship_max_dwell_time_secs', 12)
 
     # Work with txs in the censored window
     pool = lifecycle_df[
@@ -280,54 +273,45 @@ def flag_censored_transactions(
     censored = pool[
         (pool['max_fee'] >= current_base_fee) &                          # 1. FOCIL-valid
         (pool['effective_priority_fee'] >= fee_threshold) &              # 2. Competitive fee
-        (~pool['was_stuck']) &                                           # 3. Not stuck
-        (pool['tx_type'] != BLOB_TX_TYPE) &                             # 4. Not blob
-        (pool['dwell_time'] >= min_dwell) &                              # 5. Sufficient dwell
-        (~pool['was_replaced']) &                                        # 6. Not replaced
-        (~pool['tx_hash'].isin(all_included_txs)) &                     # 7. Not included
-        (pool['gas_limit'] <= prev_available) &                          # 8a. Fits prev block
-        (pool['gas_limit'] <= curr_available)                            # 8b. Fits curr block
+        (pool['tx_type'] != BLOB_TX_TYPE) &                             # 3. Not blob
+        (pool['dwell_time'] >= min_dwell) &                              # 4a. Sufficient dwell
+        (pool['dwell_time'] <= max_dwell) &                              # 4b. Capped at 1 slot
+        (~pool['was_replaced']) &                                        # 5. Not replaced
+        (~pool['tx_hash'].isin(all_included_txs)) &                     # 6. Not included
+        (pool['gas_limit'] <= prev_available) &                          # 7a. Fits prev block
+        (pool['gas_limit'] <= curr_available)                            # 7b. Fits curr block
     ].copy()
 
     return censored
 
 
-def construct_il_variant(
+def construct_il(
     lifecycle_df: pd.DataFrame,
-    variant_type: str,
-    delay: int,
-    block_num: int,
+    strategy: str,
     block_ts: int,
     base_fee: int,
-    blocks_df: pd.DataFrame,
     censored_txs: pd.DataFrame,
     already_included: set,
     config: dict,
     max_bytes: int = MAX_IL_BYTES,
 ) -> pd.DataFrame:
-    """Build one IL variant from BN lifecycle data."""
-    # Each strategy has its own mempool window
-    if variant_type == 'topfee':
+    """Build one IL from BN lifecycle data for the given strategy.
+
+    Delay is NOT relevant here — it only affects which blocks we check
+    for redundancy after the IL is built.
+    """
+    if strategy == 'topfee':
         win_start = config['analysis']['topfee_window_start_secs']
         win_end = config['analysis']['topfee_window_end_secs']
-    else:
-        win_start = config['analysis']['censored_window_start_secs']
-        win_end = config['analysis']['censored_window_end_secs']
-
-    # IL is always built from block N's mempool window. The delay only affects
-    # which block the IL is enforced at (and thus the inclusion rate check range).
-    if variant_type == 'topfee':
         pool = lifecycle_df[
             (lifecycle_df['first_seen'] >= block_ts + win_start) &
             (lifecycle_df['first_seen'] <= block_ts + win_end)
         ].copy()
-
         return build_topfee_il(pool, base_fee, already_included, max_bytes)
 
-    elif variant_type == 'censored':
+    elif strategy == 'censored':
         if censored_txs is None or len(censored_txs) == 0:
             return pd.DataFrame()
-        # Revalidate against current base fee
         candidates = censored_txs[censored_txs['max_fee'] >= base_fee].copy()
         if len(candidates) == 0:
             return pd.DataFrame()
@@ -348,7 +332,7 @@ def construct_il_variant(
         return pack_il(candidates, max_bytes)
 
     else:
-        raise ValueError(f"Unknown variant_type: {variant_type}")
+        raise ValueError(f"Unknown strategy: {strategy}")
 
 
 # ---------------------------------------------------------------------------
@@ -363,13 +347,12 @@ def process_single_block(
     config: dict,
     collect_metrics: bool = True,
 ) -> dict | None:
-    """Process a single block: build 6 IL variants, compute metrics."""
+    """Process a single block: build 2 ILs, evaluate redundancy at 3 delays."""
     block_num = int(block_row['block_number'])
     block_ts = int(block_row['block_timestamp'])
     base_fee = int(block_row['base_fee'])
 
     if not collect_metrics:
-        # Warm-up: just run through to establish state
         return None
 
     result = {
@@ -382,7 +365,6 @@ def process_single_block(
     }
 
     # --- BN-specific metrics ---
-    # Use union of both strategy windows for general mempool stats
     tf_start = config['analysis']['topfee_window_start_secs']
     tf_end = config['analysis']['topfee_window_end_secs']
     cs_start = config['analysis']['censored_window_start_secs']
@@ -399,9 +381,6 @@ def process_single_block(
     result['bn_pending_count'] = len(window_txs)
     result['bn_confirmed_in_window'] = int(window_txs['was_confirmed'].sum())
     result['bn_replaced_count'] = int(window_txs['was_replaced'].sum())
-    result['bn_stuck_count'] = int(window_txs['was_stuck'].sum())
-
-    # Timing metrics for confirmed txs
     confirmed_in_window = window_txs[window_txs['timepending_ms'].notna()]
     if len(confirmed_in_window) > 0:
         result['avg_timepending_ms'] = confirmed_in_window['timepending_ms'].mean()
@@ -419,68 +398,63 @@ def process_single_block(
         result['mempool_coverage_of_next_block'] = 0.0
     result['mempool_unique_txs_in_window'] = len(window_hashes)
 
-    # --- Build all 6 variants ---
-    for delay in [0, 1, 2]:
-        for variant_type in ['topfee', 'censored']:
-            variant_name = f'{delay}delay_{variant_type}'
+    # Exclude txs already on-chain at block N
+    already_included = set()
+    for bn, txs in included_txs_map.items():
+        if bn <= block_num:
+            already_included |= txs
 
-            # IL is always built at block N. Exclude txs already on-chain.
-            already_included = set()
-            for bn, txs in included_txs_map.items():
-                if bn <= block_num:
-                    already_included |= txs
+    # Flag censored transactions once (shared across all delay evaluations)
+    censored_txs = None
+    prev_blk = blocks_df[blocks_df['block_number'] == block_num - 1]
+    curr_blk = blocks_df[blocks_df['block_number'] == block_num]
+    if len(prev_blk) > 0 and len(curr_blk) > 0:
+        censored_txs = flag_censored_transactions(
+            lifecycle_df=lifecycle_df,
+            current_block_ts=block_ts,
+            current_base_fee=base_fee,
+            prev_block_gas_used=get_block_int(prev_blk.iloc[0], 'gas_used'),
+            prev_block_gas_limit=get_block_int(prev_blk.iloc[0], 'gas_limit'),
+            curr_block_gas_used=int(block_row['gas_used']),
+            curr_block_gas_limit=int(block_row['gas_limit']),
+            all_included_txs=already_included,
+            config=config,
+        )
+        result['censored_detected_count'] = (
+            len(censored_txs) if censored_txs is not None else 0
+        )
 
-            # For censored variants, flag censored transactions at block N.
-            # The delay only affects enforcement (and thus inclusion rate check).
-            censored_txs = None
-            if variant_type == 'censored':
-                prev_blk = blocks_df[blocks_df['block_number'] == block_num - 1]
-                curr_blk = blocks_df[blocks_df['block_number'] == block_num]
+    # Build 2 ILs (one per strategy)
+    il_map = {}
+    for strategy in IL_STRATEGIES:
+        il_map[strategy] = construct_il(
+            lifecycle_df=lifecycle_df,
+            strategy=strategy,
+            block_ts=block_ts,
+            base_fee=base_fee,
+            censored_txs=censored_txs,
+            already_included=already_included,
+            config=config,
+        )
 
-                if len(prev_blk) > 0 and len(curr_blk) > 0:
-                    censored_txs = flag_censored_transactions(
-                        lifecycle_df=lifecycle_df,
-                        current_block_ts=block_ts,
-                        current_base_fee=base_fee,
-                        prev_block_gas_used=get_block_int(prev_blk.iloc[0], 'gas_used'),
-                        prev_block_gas_limit=get_block_int(prev_blk.iloc[0], 'gas_limit'),
-                        curr_block_gas_used=int(block_row['gas_used']),
-                        curr_block_gas_limit=int(block_row['gas_limit']),
-                        all_included_txs=already_included,
-                        config=config,
-                    )
+    # Evaluate redundancy at each delay level
+    for strategy in IL_STRATEGIES:
+        il_df = il_map[strategy]
+        il_size = int(il_df['tx_size'].sum()) if len(il_df) > 0 else 0
+        il_hashes = set(il_df['tx_hash']) if len(il_df) > 0 else set()
 
-                    if delay == 0:
-                        result['censored_detected_count'] = (
-                            len(censored_txs) if censored_txs is not None else 0
-                        )
+        for delay in DELAY_LEVELS:
+            variant_name = f'{delay}delay_{strategy}'
 
-            # Construct IL
-            il_df = construct_il_variant(
-                lifecycle_df=lifecycle_df,
-                variant_type=variant_type,
-                delay=delay,
-                block_num=block_num,
-                block_ts=block_ts,
-                base_fee=base_fee,
-                blocks_df=blocks_df,
-                censored_txs=censored_txs,
-                already_included=already_included,
-                config=config,
-            )
-
-            il_size = int(il_df['tx_size'].sum()) if len(il_df) > 0 else 0
+            # TX count and size are the same for all delays (same IL)
             result[f'{variant_name}_tx_count'] = len(il_df)
             result[f'{variant_name}_size_bytes'] = il_size
 
-            # Inclusion rate and redundant bandwidth.
-            # IL is built at block N. With delay D, enforced at N+1+D.
-            # Check blocks N+1 through N+1+D for natural inclusion.
-            if len(il_df) > 0:
+            # Inclusion rate: check blocks N+1 through N+1+D
+            if il_hashes:
                 included_in_range = set()
                 for bn in range(block_num + 1, block_num + 2 + delay):
                     included_in_range |= included_txs_map.get(bn, set())
-                il_hashes = set(il_df['tx_hash'])
                 redundant = il_hashes & included_in_range
                 if included_in_range:
                     rate = len(redundant) / len(il_hashes) * 100
@@ -488,7 +462,6 @@ def process_single_block(
                 else:
                     result[f'{variant_name}_inclusion_rate'] = None
 
-                # Redundant bandwidth: IL bytes wasted on already-included txs
                 redundant_size = int(il_df[il_df['tx_hash'].isin(redundant)]['tx_size'].sum())
                 result[f'{variant_name}_redundant_bytes'] = redundant_size
                 result[f'{variant_name}_useful_bytes'] = il_size - redundant_size
@@ -505,14 +478,11 @@ def process_single_block(
 # ---------------------------------------------------------------------------
 
 def analyze_block_range(start_block: int, end_block: int, config: dict) -> pd.DataFrame:
-    """Run FOCIL analysis across a block range using BN data."""
+    """FOCIL analysis: 2 ILs per slot, redundancy at 3 delay levels (BN data)."""
     log.info("Analyzing blocks %d to %d", start_block, end_block)
 
-    # Padding: max dwell time (default 120s) / 12s per slot ≈ 10 blocks.
-    # Need enough lookback so already_included covers all txs that could
-    # appear in the mempool window of the first analysis block.
-    max_dwell = config['analysis'].get('censorship_max_dwell_time_secs', 120)
-    lookback_blocks = max(3, max_dwell // 12 + 1)
+    # Lookback: 3 blocks for warm-up + already_included context.
+    lookback_blocks = 3
 
     # Fetch blocks with padding for warm-up and forward lookback
     blocks_df = fetch_block_data(start_block - lookback_blocks, end_block + 3, config)
@@ -550,17 +520,13 @@ def analyze_block_range(start_block: int, end_block: int, config: dict) -> pd.Da
     included_txs_map = fetch_included_txs(start_block - lookback_blocks, end_block + 3, config)
     log.info("Got included txs for %d blocks", len(included_txs_map))
 
-    # Warm-up phase (3 blocks)
-    log.info("Warm-up phase (3 blocks)...")
-    warmup = blocks_df[
-        (blocks_df['block_number'] >= start_block - min(3, lookback_blocks)) &
-        (blocks_df['block_number'] < start_block)
-    ]
-    for _, block_row in warmup.iterrows():
-        process_single_block(block_row, blocks_df, lifecycle_df,
-                             included_txs_map, config, collect_metrics=False)
+    # Main analysis — skip blocks with missing base_fee (NULL cast to 0 in CH)
+    blocks_df['base_fee'] = pd.to_numeric(blocks_df['base_fee'], errors='coerce')
+    zero_bf = (blocks_df['base_fee'].isna() | (blocks_df['base_fee'] == 0))
+    if zero_bf.any():
+        log.warning("Dropping %d blocks with base_fee=0 (NULL in source)", zero_bf.sum())
+        blocks_df = blocks_df[~zero_bf]
 
-    # Main analysis
     analysis_blocks = blocks_df[
         (blocks_df['block_number'] >= start_block) &
         (blocks_df['block_number'] < end_block)
@@ -586,7 +552,7 @@ def print_summary(df: pd.DataFrame):
     blocks_per_year = 7200 * 365
 
     print("\n" + "=" * 70)
-    print("BN-FOCIL ANALYSIS SUMMARY")
+    print("BN-FOCIL ANALYSIS (2 ILs x 3 delay evaluations)")
     print("=" * 70)
 
     print(f"\nBlocks analyzed: {len(df):,}")
@@ -606,7 +572,6 @@ def print_summary(df: pd.DataFrame):
     print(f"  Avg pending txs in window:   {df['bn_pending_count'].mean():,.0f}")
     print(f"  Avg confirmed in window:     {df['bn_confirmed_in_window'].mean():,.0f}")
     print(f"  Avg replaced (cancel/speed): {df['bn_replaced_count'].mean():.1f}")
-    print(f"  Avg stuck txs:               {df['bn_stuck_count'].mean():.1f}")
 
     tp = df['avg_timepending_ms'].dropna()
     if len(tp) > 0:
@@ -706,54 +671,142 @@ def print_summary(df: pd.DataFrame):
 # Main
 # ---------------------------------------------------------------------------
 
+BN_BATCH_SIZE = 100  # blocks per ClickHouse query (~20min of data, safe limit)
+
+
+def run_chunk(chunk_start: int, chunk_end: int, chunk_id: int, output_dir: Path):
+    """Run BN analysis on a single chunk and save results.
+
+    Internally processes in sub-batches of BN_BATCH_SIZE blocks so that
+    each ClickHouse query stays within timeout limits, regardless of the
+    outer chunk size.
+    """
+    try:
+        log.info(f"[Chunk {chunk_id}] Processing blocks {chunk_start:,} to {chunk_end:,}")
+
+        config = load_config()
+        batch_results = []
+
+        for batch_start in range(chunk_start, chunk_end, BN_BATCH_SIZE):
+            batch_end = min(batch_start + BN_BATCH_SIZE, chunk_end)
+            result = analyze_block_range(batch_start, batch_end, config)
+            if result is not None and len(result) > 0:
+                batch_results.append(result)
+
+        if not batch_results:
+            log.warning(f"[Chunk {chunk_id}] No results produced")
+            return None
+
+        result_df = pd.concat(batch_results, ignore_index=True)
+        output_file = output_dir / f"bn_chunk_{chunk_id:04d}_{chunk_start}_{chunk_end}.parquet"
+        result_df.to_parquet(output_file, index=False)
+
+        log.info(f"[Chunk {chunk_id}] Saved {len(result_df):,} blocks to {output_file.name}")
+        return output_file
+
+    except Exception as e:
+        log.error(f"[Chunk {chunk_id}] Failed: {e}", exc_info=True)
+        return None
+
+
 def main():
+    parser = argparse.ArgumentParser(
+        description="Batch process BN-FOCIL analysis over large block ranges")
+    parser.add_argument("start_block", type=int, help="Starting block number")
+    parser.add_argument("end_block", type=int, help="Ending block number")
+    parser.add_argument("--chunk-size", type=int, default=1000,
+                       help="Blocks per output chunk (default: 1000); "
+                            f"queries are internally sub-batched at {BN_BATCH_SIZE} blocks")
+    parser.add_argument("--parallel", type=int, default=1,
+                       help="Number of parallel workers (default: 1 = sequential)")
+    parser.add_argument("--output-dir", type=str, default="results/bn_chunks",
+                       help="Directory for chunk outputs")
+    parser.add_argument("--resume", action="store_true",
+                       help="Skip chunks that already have output files")
+
+    args = parser.parse_args()
+
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s %(levelname)s %(message)s',
-        datefmt='%H:%M:%S',
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
     )
 
-    config = load_config()
+    if args.end_block <= args.start_block:
+        log.error("end_block must be greater than start_block")
+        return 1
 
-    start_block = config['analysis'].get('bn_start_block', DEFAULT_START_BLOCK)
-    end_block = config['analysis'].get('bn_end_block', DEFAULT_END_BLOCK)
+    total_blocks = args.end_block - args.start_block
+    num_chunks = (total_blocks + args.chunk_size - 1) // args.chunk_size
 
-    print("=" * 70)
-    print("FOCIL ANALYSIS (BLOCKNATIVE DATA)")
-    print("=" * 70)
-    print(f"Block range: {start_block:,} - {end_block:,} "
-          f"({end_block - start_block} blocks)")
-    print(f"Top Fee window: [{config['analysis']['topfee_window_start_secs']}, "
-          f"{config['analysis']['topfee_window_end_secs']}] seconds")
-    print(f"Censored window: [{config['analysis']['censored_window_start_secs']}, "
-          f"{config['analysis']['censored_window_end_secs']}] seconds")
-    print(f"IL size cap: {MAX_IL_BYTES:,} bytes ({MAX_IL_BYTES / 1024:.1f} KiB)")
-    print(f"TX types: 0, 1, 2 (excluding blob type 3)")
+    log.info("=" * 70)
+    log.info("BN-FOCIL BATCH RUNNER")
+    log.info("=" * 70)
+    log.info(f"Block range: {args.start_block:,} to {args.end_block:,}")
+    log.info(f"Total blocks: {total_blocks:,}")
+    log.info(f"Chunk size: {args.chunk_size:,}")
+    log.info(f"Number of chunks: {num_chunks:,}")
+    log.info(f"Parallel workers: {args.parallel}")
+    log.info(f"Output directory: {args.output_dir}")
 
-    batch_size = config['analysis'].get('batch_size_blocks', 100)
-    all_results = []
+    output_dir = Path(__file__).parent.parent / args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    for batch_start in range(start_block, end_block, batch_size):
-        batch_end = min(batch_start + batch_size, end_block)
-        result = analyze_block_range(batch_start, batch_end, config)
-        if result is not None:
-            all_results.append(result)
+    chunks = []
+    for chunk_id, chunk_start in enumerate(range(args.start_block, args.end_block, args.chunk_size)):
+        chunk_end = min(chunk_start + args.chunk_size, args.end_block)
 
-    if not all_results:
-        log.error("No results produced.")
-        return
+        output_file = output_dir / f"bn_chunk_{chunk_id:04d}_{chunk_start}_{chunk_end}.parquet"
+        if args.resume and output_file.exists():
+            log.info(f"[Chunk {chunk_id}] Skipping (already exists): {output_file.name}")
+            continue
 
-    df = pd.concat(all_results, ignore_index=True)
+        chunks.append((chunk_start, chunk_end, chunk_id, output_dir))
 
-    # Save results
-    results_dir = Path(__file__).parent.parent / "results"
-    results_dir.mkdir(exist_ok=True)
-    output_file = results_dir / "bn_focil_analysis.parquet"
-    df.to_parquet(output_file, index=False)
-    print(f"\nResults saved to: {output_file}")
+    if not chunks:
+        log.info("All chunks already processed!")
+        return 0
 
-    print_summary(df)
+    log.info(f"Processing {len(chunks):,} chunks...")
+
+    completed = 0
+    failed = 0
+
+    if args.parallel == 1:
+        for chunk_start, chunk_end, chunk_id, out_dir in chunks:
+            result = run_chunk(chunk_start, chunk_end, chunk_id, out_dir)
+            if result:
+                completed += 1
+            else:
+                failed += 1
+    else:
+        with ProcessPoolExecutor(max_workers=args.parallel) as executor:
+            futures = {
+                executor.submit(run_chunk, start, end, cid, out_dir): cid
+                for start, end, cid, out_dir in chunks
+            }
+
+            for future in as_completed(futures):
+                chunk_id = futures[future]
+                try:
+                    result = future.result()
+                    if result:
+                        completed += 1
+                    else:
+                        failed += 1
+                except Exception as e:
+                    log.error(f"[Chunk {chunk_id}] Exception: {e}")
+                    failed += 1
+
+    log.info("=" * 70)
+    log.info("BATCH PROCESSING COMPLETE")
+    log.info("=" * 70)
+    log.info(f"Completed: {completed:,} chunks")
+    log.info(f"Failed: {failed:,} chunks")
+    log.info(f"Output directory: {output_dir}")
+
+    return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
