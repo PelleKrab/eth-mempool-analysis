@@ -322,9 +322,9 @@ def process_single_block(
             all_included_before |= txs
     mempool_senders_with_inclusion = set(mempool_df[
         mempool_df['tx_hash'].isin(all_included_before)
-    ]['sender'].unique())
+    ]['sender'].dropna().unique())
     active_senders = mempool_senders_with_inclusion | {
-        s for s in mempool_df['sender'].unique()
+        s for s in mempool_df['sender'].dropna().unique()
         if s.lower() in onchain_active_addresses
     }
 
@@ -452,6 +452,7 @@ def analyze_block_range(start_block: int, end_block: int, config: dict,
     FROM mempool_transaction
     WHERE event_date_time >= toDateTime({int(min_ts)})
       AND event_date_time < toDateTime({int(max_ts)})
+      AND gas_fee_cap IS NOT NULL
     ORDER BY event_date_time
     """
     mempool_df = execute_query(mempool_query, config)
@@ -493,6 +494,13 @@ def analyze_block_range(start_block: int, end_block: int, config: dict,
     onchain_active_addresses = check_addresses_on_chain(
         all_senders, start_block, config, cache=address_cache,
     )
+
+    # Drop blocks with missing base_fee (NULL cast to 0 in ClickHouse)
+    blocks_df['base_fee'] = pd.to_numeric(blocks_df['base_fee'], errors='coerce')
+    zero_bf = blocks_df['base_fee'].isna() | (blocks_df['base_fee'] == 0)
+    if zero_bf.any():
+        log.warning("Dropping %d blocks with base_fee=0 (NULL in source)", zero_bf.sum())
+        blocks_df = blocks_df[~zero_bf]
 
     # Main processing
     log.info("Main processing phase...")
