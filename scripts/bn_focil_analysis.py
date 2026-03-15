@@ -339,6 +339,67 @@ def construct_il(
 # Per-block processing
 # ---------------------------------------------------------------------------
 
+def _ts_to_block_num(ts: float, blocks_sorted: pd.DataFrame) -> int:
+    """Return block_number of the last block produced at or before timestamp ts."""
+    idx = int(blocks_sorted['block_timestamp'].searchsorted(ts, side='right')) - 1
+    if idx < 0:
+        log.debug("_ts_to_block_num: timestamp %.0f precedes all known blocks, clamping to first", ts)
+        idx = 0
+    return int(blocks_sorted['block_number'].iloc[idx])
+
+
+def _build_tx_latency_records(
+    il_df: pd.DataFrame,
+    il_hashes: set,
+    next_block_included: set,
+    lc_lookup: dict,
+    blocks_sorted: pd.DataFrame,
+    block_num: int,
+    strategy: str,
+) -> list:
+    """Build per-TX latency records for one IL.
+
+    One record per IL tx.  Uses the 0-delay definition of redundancy (tx in N+1
+    = redundant).  For non-redundant confirmed txs, computes delay_from_il via
+    blocks_pending + first_seen timestamp → block mapping.
+
+    iterrows() is intentional: ~50 txs/IL is fast; batch sizes are capped at
+    BN_BATCH_SIZE (100 blocks) so the total iteration count stays bounded.
+    """
+    records = []
+    redundant_0delay = il_hashes & next_block_included
+    for _, tx_row in il_df.iterrows():
+        tx_hash = tx_row['tx_hash']
+        is_redundant = tx_hash in redundant_0delay
+        lc = lc_lookup.get(tx_hash, {})
+
+        # Delay from this IL block to BN-confirmed inclusion block.
+        # blocks_pending = total blocks from first_seen to confirmation.
+        # first_seen_block = block produced at/before first_seen timestamp.
+        # => included_block = first_seen_block + blocks_pending
+        # => delay_from_il = included_block - block_num
+        delay_from_il = None
+        if not is_redundant and lc.get('was_confirmed') and pd.notna(lc.get('blocks_pending')):
+            first_seen_block = _ts_to_block_num(lc['first_seen'], blocks_sorted)
+            included_block = first_seen_block + int(lc['blocks_pending'])
+            delay_from_il = included_block - block_num
+
+        records.append({
+            'block_number':           block_num,
+            'strategy':               strategy,
+            'tx_hash':                tx_hash,
+            'is_redundant':           is_redundant,
+            'was_confirmed':          lc.get('was_confirmed', None),
+            'was_replaced':           lc.get('was_replaced', None),
+            'final_status':           lc.get('final_status', None),
+            'blocks_pending':         lc.get('blocks_pending', None),
+            'delay_from_il':          delay_from_il,
+            'tx_size':                int(tx_row.get('tx_size', 0) or 0),
+            'effective_priority_fee': float(tx_row.get('effective_priority_fee', 0) or 0),
+        })
+    return records
+
+
 def process_single_block(
     block_row: pd.Series,
     blocks_df: pd.DataFrame,
@@ -346,14 +407,23 @@ def process_single_block(
     included_txs_map: dict,
     config: dict,
     collect_metrics: bool = True,
-) -> dict | None:
-    """Process a single block: build 2 ILs, evaluate redundancy at 3 delays."""
+    lc_lookup: dict | None = None,
+    blocks_sorted: pd.DataFrame | None = None,
+) -> tuple[dict | None, list]:
+    """Process a single block: build 2 ILs, evaluate redundancy at 3 delays.
+
+    Returns (per_block_result, tx_latency_records).  tx_latency_records contains
+    one entry per IL tx (both strategies), recording whether it was redundant
+    (already in N+1) and — for non-redundant txs — how long until BN confirmed it.
+    """
     block_num = int(block_row['block_number'])
     block_ts = int(block_row['block_timestamp'])
     base_fee = int(block_row['base_fee'])
 
+    tx_records: list = []
+
     if not collect_metrics:
-        return None
+        return None, tx_records
 
     result = {
         'block_number': block_num,
@@ -437,6 +507,8 @@ def process_single_block(
             config=config,
         )
 
+    next_block_included = included_txs_map.get(block_num + 1, set())
+
     # Evaluate redundancy at each delay level
     for strategy in IL_STRATEGIES:
         il_df = il_map[strategy]
@@ -470,15 +542,26 @@ def process_single_block(
                 result[f'{variant_name}_redundant_bytes'] = 0
                 result[f'{variant_name}_useful_bytes'] = 0
 
-    return result
+        # Per-TX latency records (one entry per tx, not per delay level).
+        if lc_lookup is not None and blocks_sorted is not None and len(il_df) > 0:
+            tx_records.extend(_build_tx_latency_records(
+                il_df, il_hashes, next_block_included, lc_lookup,
+                blocks_sorted, block_num, strategy,
+            ))
+
+    return result, tx_records
 
 
 # ---------------------------------------------------------------------------
 # Range analysis
 # ---------------------------------------------------------------------------
 
-def analyze_block_range(start_block: int, end_block: int, config: dict) -> pd.DataFrame:
-    """FOCIL analysis: 2 ILs per slot, redundancy at 3 delay levels (BN data)."""
+def analyze_block_range(start_block: int, end_block: int, config: dict) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    """FOCIL analysis: 2 ILs per slot, redundancy at 3 delay levels (BN data).
+
+    Returns (per_block_df, tx_latency_df).  tx_latency_df has one row per IL tx
+    with redundancy flag and, for non-redundant txs, BN-derived delay to inclusion.
+    """
     log.info("Analyzing blocks %d to %d", start_block, end_block)
 
     # Lookback: 3 blocks for warm-up + already_included context.
@@ -488,9 +571,14 @@ def analyze_block_range(start_block: int, end_block: int, config: dict) -> pd.Da
     blocks_df = fetch_block_data(start_block - lookback_blocks, end_block + 3, config)
     if len(blocks_df) == 0:
         log.warning("No blocks found for range %d-%d", start_block, end_block)
-        return None
+        return None, None
 
-    log.info("Got %d blocks (including warm-up and lookback)", len(blocks_df))
+    # canonical_beacon_block has one row per beacon node — keep one per block.
+    # Sort by block_timestamp first so the surviving row is deterministic
+    # (earliest timestamp wins; arbitrary otherwise due to query row order).
+    blocks_df['base_fee'] = pd.to_numeric(blocks_df['base_fee'], errors='coerce')
+    blocks_df = blocks_df.sort_values('block_timestamp').drop_duplicates(subset='block_number', keep='first')
+    log.info("Got %d unique blocks (including warm-up and lookback)", len(blocks_df))
 
     # Time range for mempool query (cover both strategy windows with padding)
     tf_start = config['analysis']['topfee_window_start_secs']
@@ -506,14 +594,22 @@ def analyze_block_range(start_block: int, end_block: int, config: dict) -> pd.Da
     log.info("Got %d raw BN events", len(bn_raw))
 
     if len(bn_raw) == 0:
-        log.error("No BlockNative data for this range. "
-                  "Ensure block range has BN coverage (Feb-Mar 2025).")
-        return None
+        log.error("No BlockNative data for this range.")
+        return None, None
 
     # Build lifecycle
     log.info("Building tx lifecycle summaries...")
     lifecycle_df = build_tx_lifecycle(bn_raw)
     log.info("Got %d unique transactions", len(lifecycle_df))
+
+    # Fast lookup: tx_hash -> lifecycle row dict (for per-TX latency).
+    # Memory: ~1-2 KB per tx * ~10k txs/batch = tens of MB, fine at BN_BATCH_SIZE=100.
+    lc_lookup = lifecycle_df.set_index('tx_hash').to_dict('index')
+
+    # Sorted blocks array for O(log n) timestamp → block_number mapping
+    blocks_sorted = (blocks_df[['block_number', 'block_timestamp']]
+                     .sort_values('block_timestamp')
+                     .reset_index(drop=True))
 
     # Fetch included transactions for cross-validation
     log.info("Fetching included transactions (canonical)...")
@@ -521,7 +617,6 @@ def analyze_block_range(start_block: int, end_block: int, config: dict) -> pd.Da
     log.info("Got included txs for %d blocks", len(included_txs_map))
 
     # Main analysis — skip blocks with missing base_fee (NULL cast to 0 in CH)
-    blocks_df['base_fee'] = pd.to_numeric(blocks_df['base_fee'], errors='coerce')
     zero_bf = (blocks_df['base_fee'].isna() | (blocks_df['base_fee'] == 0))
     if zero_bf.any():
         log.warning("Dropping %d blocks with base_fee=0 (NULL in source)", zero_bf.sum())
@@ -533,14 +628,20 @@ def analyze_block_range(start_block: int, end_block: int, config: dict) -> pd.Da
     ]
 
     results = []
+    all_tx_records = []
     for _, block_row in tqdm(analysis_blocks.iterrows(),
                               total=len(analysis_blocks), desc="Processing"):
-        row = process_single_block(block_row, blocks_df, lifecycle_df,
-                                    included_txs_map, config, collect_metrics=True)
+        row, tx_recs = process_single_block(
+            block_row, blocks_df, lifecycle_df, included_txs_map, config,
+            collect_metrics=True, lc_lookup=lc_lookup, blocks_sorted=blocks_sorted,
+        )
         if row is not None:
             results.append(row)
+        all_tx_records.extend(tx_recs)
 
-    return pd.DataFrame(results) if results else None
+    result_df = pd.DataFrame(results) if results else None
+    tx_df = pd.DataFrame(all_tx_records) if all_tx_records else None
+    return result_df, tx_df
 
 
 # ---------------------------------------------------------------------------
@@ -686,12 +787,15 @@ def run_chunk(chunk_start: int, chunk_end: int, chunk_id: int, output_dir: Path)
 
         config = load_config()
         batch_results = []
+        batch_tx_records = []
 
         for batch_start in range(chunk_start, chunk_end, BN_BATCH_SIZE):
             batch_end = min(batch_start + BN_BATCH_SIZE, chunk_end)
-            result = analyze_block_range(batch_start, batch_end, config)
-            if result is not None and len(result) > 0:
-                batch_results.append(result)
+            result_df, tx_df = analyze_block_range(batch_start, batch_end, config)
+            if result_df is not None and len(result_df) > 0:
+                batch_results.append(result_df)
+            if tx_df is not None and len(tx_df) > 0:
+                batch_tx_records.append(tx_df)
 
         if not batch_results:
             log.warning(f"[Chunk {chunk_id}] No results produced")
@@ -700,8 +804,14 @@ def run_chunk(chunk_start: int, chunk_end: int, chunk_id: int, output_dir: Path)
         result_df = pd.concat(batch_results, ignore_index=True)
         output_file = output_dir / f"bn_chunk_{chunk_id:04d}_{chunk_start}_{chunk_end}.parquet"
         result_df.to_parquet(output_file, index=False)
-
         log.info(f"[Chunk {chunk_id}] Saved {len(result_df):,} blocks to {output_file.name}")
+
+        if batch_tx_records:
+            tx_df = pd.concat(batch_tx_records, ignore_index=True)
+            latency_file = output_dir / f"bn_chunk_{chunk_id:04d}_{chunk_start}_{chunk_end}_latency.parquet"
+            tx_df.to_parquet(latency_file, index=False)
+            log.info(f"[Chunk {chunk_id}] Saved {len(tx_df):,} TX records to {latency_file.name}")
+
         return output_file
 
     except Exception as e:
