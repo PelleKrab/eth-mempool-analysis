@@ -3,14 +3,20 @@ import numpy as np
 from pathlib import Path
 import datetime
 
+def _eff(useful, total):
+    return useful / total * 100 if total > 0 else 0
+
+
+def _col_mean(df, col, default=0):
+    return df[col].mean() if col in df.columns else default
+
+
 def generate_report(parquet_file):
     df = pd.read_parquet(parquet_file)
     
     # --- derived metrics ---
     blocks_per_year = 2628000 # approx 12s blocks
-    # actually let's use the observed time range to project annual if needed, 
-    # but standardized blocks_per_year is better for comparisons.
-    # Ethereum is exactly 12s/block => 5 slots/min * 60 * 24 * 365 = 2,628,000
+    # 12s blocks: 5 slots/min * 60 * 24 * 365
     
     total_blocks = len(df)
     start_blk = df['block_number'].min()
@@ -49,28 +55,40 @@ def generate_report(parquet_file):
     # Inclusion Rates
     # Data is already in percentage (0-100)
     tf_inc_0 = df['0delay_topfee_inclusion_rate'].mean()
-    tf_inc_1 = df['1delay_topfee_inclusion_rate'].mean() if '1delay_topfee_inclusion_rate' in df.columns else 0
-    tf_inc_2 = df['2delay_topfee_inclusion_rate'].mean() if '2delay_topfee_inclusion_rate' in df.columns else 0
-    
-    # Redundancy (Useful vs Redundant)
-    # 0delay_topfee_redundant_bytes vs useful
-    tf_useful = df['0delay_topfee_useful_bytes'].mean()
-    tf_redundant = df['0delay_topfee_redundant_bytes'].mean()
-    tf_efficiency = (tf_useful / tf_bytes * 100) if tf_bytes > 0 else 0
+    tf_inc_1 = _col_mean(df, '1delay_topfee_inclusion_rate')
+    tf_inc_2 = _col_mean(df, '2delay_topfee_inclusion_rate')
+
+    # Redundancy (Useful vs Redundant) - all 3 delays
+    tf_useful_0 = df['0delay_topfee_useful_bytes'].mean()
+    tf_useful_1 = _col_mean(df, '1delay_topfee_useful_bytes')
+    tf_useful_2 = _col_mean(df, '2delay_topfee_useful_bytes')
+    tf_redundant_0 = df['0delay_topfee_redundant_bytes'].mean()
+    tf_redundant_1 = _col_mean(df, '1delay_topfee_redundant_bytes')
+    tf_redundant_2 = _col_mean(df, '2delay_topfee_redundant_bytes')
+    tf_efficiency = (tf_useful_0 / tf_bytes * 100) if tf_bytes > 0 else 0
+    tf_useful_reduction_1 = ((tf_useful_0 - tf_useful_1) / tf_useful_0 * 100) if tf_useful_0 > 0 else 0
 
     # --- Section 3: Censored/Robust Strategy ---
     c_txs = df['0delay_censored_tx_count'].mean()
     c_bytes = df['0delay_censored_size_bytes'].mean()
     c_kb = c_bytes / 1024
     c_annual_gb = (c_bytes * blocks_per_year) / (1024**3)
-    
+
     c_inc_0 = df['0delay_censored_inclusion_rate'].mean()
-    c_inc_1 = df['1delay_censored_inclusion_rate'].mean() if '1delay_censored_inclusion_rate' in df.columns else 0
-    c_inc_2 = df['2delay_censored_inclusion_rate'].mean() if '2delay_censored_inclusion_rate' in df.columns else 0
-    
+    c_inc_1 = _col_mean(df, '1delay_censored_inclusion_rate')
+    c_inc_2 = _col_mean(df, '2delay_censored_inclusion_rate')
+
+    c_useful_0 = _col_mean(df, '0delay_censored_useful_bytes')
+    c_useful_1 = _col_mean(df, '1delay_censored_useful_bytes')
+    c_useful_2 = _col_mean(df, '2delay_censored_useful_bytes')
+    c_redundant_0 = _col_mean(df, '0delay_censored_redundant_bytes')
+    c_redundant_1 = _col_mean(df, '1delay_censored_redundant_bytes')
+    c_redundant_2 = _col_mean(df, '2delay_censored_redundant_bytes')
+    c_efficiency = (c_useful_0 / c_bytes * 100) if c_bytes > 0 else 0
+
     # --- Section 4: Censorship/Latency ---
-    # censored_detected_count = txs that were high fee but delayed
     censored_avg = df['censored_detected_count'].mean()
+    censored_median = df['censored_detected_count'].median()
     censored_blocks_pct = (df[df['censored_detected_count'] > 0].shape[0] / total_blocks) * 100
 
     # Report Text
@@ -103,18 +121,29 @@ def generate_report(parquet_file):
     report.append(f"| **2-Delay Inclusion Rate** | {tf_inc_2:.1f}% | {c_inc_2:.1f}% | - |")
     report.append("")
 
-    report.append("### Efficiency (Top Fee Strategy)")
-    report.append(f"- **Useful Data:** {tf_useful/1024:.2f} KiB/blk")
-    report.append(f"- **Redundant Data:** {tf_redundant/1024:.2f} KiB/blk")
-    report.append(f"- **Efficiency:** {tf_efficiency:.1f}% (unique bytes / total bytes)")
+    report.append("### Top Fee IL — Useful / Redundant by Delay")
+    report.append("| Delay | Total (KiB/blk) | Useful (KiB/blk) | Redundant (KiB/blk) | Efficiency |")
+    report.append("| :--- | :--- | :--- | :--- | :--- |")
+    report.append(f"| 0-slot | {tf_kb:.2f} | {tf_useful_0/1024:.2f} | {tf_redundant_0/1024:.2f} | {tf_efficiency:.1f}% |")
+    report.append(f"| 1-slot | {tf_kb:.2f} | {tf_useful_1/1024:.2f} | {tf_redundant_1/1024:.2f} | {_eff(tf_useful_1, tf_bytes):.1f}% |")
+    report.append(f"| 2-slot | {tf_kb:.2f} | {tf_useful_2/1024:.2f} | {tf_redundant_2/1024:.2f} | {_eff(tf_useful_2, tf_bytes):.1f}% |")
+    report.append("")
+    report.append(f"- **Useful bytes reduction 0→1 slot:** {tf_useful_reduction_1:.1f}%")
+    report.append("")
+
+    report.append("### Censored IL — Useful / Redundant by Delay")
+    report.append("| Delay | Total (KiB/blk) | Useful (KiB/blk) | Redundant (KiB/blk) | Efficiency |")
+    report.append("| :--- | :--- | :--- | :--- | :--- |")
+    report.append(f"| 0-slot | {c_kb:.2f} | {c_useful_0/1024:.2f} | {c_redundant_0/1024:.2f} | {c_efficiency:.1f}% |")
+    report.append(f"| 1-slot | {c_kb:.2f} | {c_useful_1/1024:.2f} | {c_redundant_1/1024:.2f} | {_eff(c_useful_1, c_bytes):.1f}% |")
+    report.append(f"| 2-slot | {c_kb:.2f} | {c_useful_2/1024:.2f} | {c_redundant_2/1024:.2f} | {_eff(c_useful_2, c_bytes):.1f}% |")
     report.append("")
 
     report.append("## 3. Censorship & Latency Detection")
-    report.append("Transactions detected as 'high fee but not included' (potential censorship or latency issues).")
     report.append(f"- **Avg Suspicious Txs per Block:** {censored_avg:.2f}")
+    report.append(f"- **Median Suspicious Txs per Block:** {censored_median:.0f}")
     report.append(f"- **Blocks with Suspicious Txs:** {censored_blocks_pct:.1f}%")
-    
-    # Distribution of censorship counts
+
     if 'censored_detected_count' in df.columns:
         counts = df['censored_detected_count'].value_counts().sort_index().head(5)
         report.append("\n**Distribution (Top 5 counts):**")
@@ -125,7 +154,11 @@ def generate_report(parquet_file):
     print("\n".join(report))
 
 if __name__ == "__main__":
-    file_path = Path("/home/router/eth-mempool-analysis/results/bn_full_analysis.parquet")
+    import sys
+    if len(sys.argv) > 1:
+        file_path = Path(sys.argv[1])
+    else:
+        file_path = Path("/home/router/eth-mempool-analysis/results/bn_full_analysis_v2.parquet")
     if file_path.exists():
         generate_report(file_path)
     else:
