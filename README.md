@@ -75,7 +75,7 @@ pip install -r requirements.txt
 
 ### Configuration
 
-Create a `.env` file in the project root or set environment variables:
+Copy `.env.example` to `.env` in the project root (or set environment variables directly):
 
 ```
 CLICKHOUSE_URL=https://clickhouse.xatu.ethpandaops.io
